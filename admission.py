@@ -20,6 +20,123 @@ def _plain(block):
     return {k: v for k, v in block.items() if k != 'cache_control'} if isinstance(block, dict) else block
 
 
+# Deliberately recognize one native template, not arbitrary reminders or email text.
+_ACCOUNT_REMINDER = re.compile(
+    r"<system-reminder>\nAs you answer the user's questions, you can use the "
+    r"following context:\n# userEmail\nThe user's email address is "
+    r"[^\s<>@]+@[^\s<>@]+\."
+    r"(?: Use it only to identify the user, such as for authorship, attribution, or filtering "
+    r"their own work\. Never send it to an unrelated service, such as in a request header, "
+    r"URL, or payload, unless the user explicitly asks\.)?"
+    r"(?:\n\nIMPORTANT: this context may or may not be relevant to your tasks\. You should "
+    r"not respond to this context unless it is highly relevant to your task\.)?"
+    r"\n</system-reminder>\n?")
+
+
+def _account_block(block):
+    return (isinstance(block, dict) and set(block) == {'type', 'text'}
+            and block['type'] == 'text' and isinstance(block['text'], str)
+            and _ACCOUNT_REMINDER.fullmatch(block['text']) is not None)
+
+
+def _without_account(sent, host):
+    """Return a reconciled block, or None when anything beyond the template differs."""
+    if _plain(sent) == _plain(host):
+        return copy.deepcopy(sent)
+    if not isinstance(sent, dict) or not isinstance(host, dict):
+        return None
+    kind = host.get('type')
+    field = 'text' if kind == 'text' else 'content' if kind == 'tool_result' else None
+    if field is None or field not in sent or field not in host:
+        return None
+    left, right = _plain(sent), _plain(host)
+    actual, expected = left.pop(field), right.pop(field)
+    if left != right:
+        return None
+    if isinstance(actual, str) and isinstance(expected, str):
+        if not actual.startswith(expected):
+            return None
+        suffix = actual[len(expected):]
+        if not any(suffix.startswith(sep) and _ACCOUNT_REMINDER.fullmatch(suffix[len(sep):])
+                   for sep in ('\n\n', '\n')):
+            return None
+        restored = expected
+    elif kind == 'tool_result' and isinstance(actual, list) and isinstance(expected, list):
+        if len(actual) not in (len(expected), len(expected) + 1):
+            return None
+        restored = [_without_account(a, b) for a, b in zip(actual, expected)]
+        if any(b is None for b in restored):
+            return None
+        if len(actual) > len(expected) and not _account_block(actual[-1]):
+            return None
+    else:
+        return None
+    result = copy.deepcopy(sent)
+    result[field] = restored
+    return result
+
+
+def _normalize_account(messages, queried):
+    """Anchor a complete unique host frame; preserve unknown surrounding native context."""
+    last = max((i for i, m in enumerate(messages) if m.get('role') == 'assistant'), default=-1)
+    newest = messages[last + 1] if last + 1 < len(messages) else {}
+    content = newest.get('content')
+    if newest.get('role') != 'user' or not isinstance(content, list):
+        return False
+    matches = []
+    for start in range(len(content) - len(queried) + 1):
+        restored = [_without_account(a, b) for a, b in zip(content[start:], queried)]
+        if all(b is not None for b in restored):
+            matches.append((start, restored))
+    if len(matches) != 1:
+        return False
+    start, restored = matches[0]
+    before, after = content[:start], content[start + len(queried):]
+    # Only a standalone reminder immediately before the queried host frame is recognized.
+    # Marked/extended reminder blocks fail safe: never discard their directives or metadata.
+    if len(before) == 1 and _account_block(before[0]):
+        before = []
+    if len(after) == 1 and _account_block(after[0]):
+        after = []
+    normalized = before + restored + after
+    if normalized == content:
+        return False
+    newest['content'] = normalized
+    return True
+
+
+def _frame_first(messages, queried):
+    """Put Hermes' first user turn ahead of the context native prepends to it (#77).
+
+    On the opening request native puts its per-request context block (the account-email
+    reminder) *before* the frame Hermes queried; on every later request that turn is replayed
+    without it. Nothing of the first turn therefore recurs, and call #2 re-writes the whole of
+    it, which is most of a cron run whose first turn carries a source pack. On later turns
+    native already appends its context after the host content. Moving the prepended text
+    blocks behind the frame uses that same order for the first turn: no block is added,
+    dropped or edited, and the frame becomes a prefix the next request replays byte-identically.
+
+    Only the conversation's first turn is touched (no assistant message yet), only when the
+    queried frame occurs exactly once, and only when everything before it is plain text.
+    Returns whether the order changed."""
+    if any(m.get('role') == 'assistant' for m in messages):
+        return False
+    first = next((m for m in messages if m.get('role') == 'user'), {})
+    content = first.get('content')
+    if not isinstance(content, list) or not queried or len(content) <= len(queried):
+        return False
+    want = [_plain(b) for b in queried]
+    starts = [k for k in range(len(content) - len(queried) + 1)
+              if [_plain(b) for b in content[k:k + len(queried)]] == want]
+    if len(starts) != 1 or starts[0] == 0:
+        return False
+    k = starts[0]
+    if not all(isinstance(b, dict) and b.get('type') == 'text' for b in content[:k]):
+        return False
+    first['content'] = content[k:k + len(queried)] + content[:k] + content[k + len(queried):]
+    return True
+
+
 def pin_message_breakpoint(payload, queried):
     """Keep the single message ``cache_control`` on content the next request replays unchanged.
 
@@ -34,18 +151,22 @@ def pin_message_breakpoint(payload, queried):
     tool_result (parallel calls, native's reminder on the last result), a breakpoint on the
     unchanged results before it measured no cache hit even though they replay byte-identical
     (#33, cause unknown), so the span ends at the preceding assistant message.
-    The breakpoint never moves later, content never changes, and any payload that does not
-    parse forwards as is."""
+    Recognized native account reminders are first normalized against the host frame.
+    The breakpoint never moves later within that normalized frame; unparseable payloads
+    forward as is."""
     if not queried:
         return payload
     try:
         body = json.loads(payload)
         messages = body['messages']
+        normalized = _normalize_account(messages, queried)
+        reordered = _frame_first(messages, queried)
         blocks = [(i, j, b) for i, m in enumerate(messages) if isinstance(m.get('content'), list)
                   for j, b in enumerate(m['content'])]
         marked = [(i, j, b) for i, j, b in blocks if isinstance(b, dict) and 'cache_control' in b]
         if len(marked) != 1:
-            return payload
+            return (json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+                    if normalized else payload)
         last = max((i for i, m in enumerate(messages) if m.get('role') == 'assistant'), default=-1)
         stable = [(i, j, b) for i, j, b in blocks if i <= last]
         newest = messages[last + 1] if last + 1 < len(messages) else {}
@@ -61,9 +182,10 @@ def pin_message_breakpoint(payload, queried):
         target = next(((i, j, b) for i, j, b in reversed(stable)
                        if isinstance(b, dict) and b.get('type') not in UNCACHEABLE), None)
         i, j, block = marked[0]
-        if target is None or (target[0], target[1]) >= (i, j):
+        if target is not None and (target[0], target[1]) < (i, j):
+            target[2]['cache_control'] = block.pop('cache_control')
+        elif not (reordered or normalized):
             return payload
-        target[2]['cache_control'] = block.pop('cache_control')
         return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     except (ValueError, TypeError, KeyError, AttributeError, IndexError):
         return payload
@@ -223,7 +345,7 @@ class Handler(BaseHTTPRequestHandler):
                 if gate.cancelled:
                     return
                 gate.sockets.add(upstream_socket)
-            # Request identity and payload remain native; only HTTP transfer encoding changes.
+            # Native identity is preserved; the body has the bounded normalization above.
             headers = {k:v for k,v in self.headers.items() if k.lower() not in ('host','connection','content-length','transfer-encoding','proxy-authorization','proxy-connection','accept-encoding')}
             headers['Accept-Encoding'] = 'identity'
             route = target.path.rstrip('/') + '/v1/messages' + ('?' + path.query if path.query else '')
