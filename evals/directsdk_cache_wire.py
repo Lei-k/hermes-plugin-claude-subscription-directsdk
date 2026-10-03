@@ -1,6 +1,7 @@
 """Offline native cache-prefix regression (no inference or account credentials).
 
 Run: python3 evals/directsdk_cache_wire.py /absolute/path/to/claude
+Add --opening --account-context --parallel for the synthetic OAuth first-turn regression.
 Uses the real DirectSDK and native binary, with a synthetic loopback Messages peer.
 Checks exact cached-prefix reuse, not cache hit rates; usage is deliberately synthetic.
 Only compact hash receipts go to stdout. No raw traces or fixtures are retained.
@@ -70,6 +71,8 @@ class Peer(BaseHTTPRequestHandler):
         blocks = [THINKING, {"type": "tool_use", "id": f"toolu_public_{number}",
                   "name": body["tools"][0]["name"], "input": {}}] if self.server.tools else [
                       {"type": "text", "text": "PUBLIC SYNTHETIC ANSWER"}]
+        if self.server.tools and self.server.parallel:
+            blocks.append({**blocks[-1], "id": f"toolu_public_{number}_parallel"})
         stop = "tool_use" if self.server.tools else "end_turn"
         message = {"id": f"msg_public_{number}", "type": "message", "role": "assistant",
                    "model": body["model"], "content": blocks, "stop_reason": stop,
@@ -99,7 +102,7 @@ class Peer(BaseHTTPRequestHandler):
         emit({"type": "message_stop"})
 
 
-def run(binary, model):
+def run(binary, model, opening=False, account_context=False, parallel=False):
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root))
     spec = importlib.util.spec_from_file_location(
@@ -107,7 +110,7 @@ def run(binary, model):
     native = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(native)
     with tempfile.TemporaryDirectory(prefix="directsdk-cache-") as tmp, ThreadingHTTPServer(("127.0.0.1", 0), Peer) as peer:
-        peer.wires, peer.tools = [], True
+        peer.wires, peer.tools, peer.parallel = [], True, parallel
         worker = threading.Thread(target=peer.serve_forever, daemon=True)
         worker.start()
         env = {"PATH": os.defpath, "HOME": tmp, "HERMES_HOME": tmp,
@@ -119,11 +122,29 @@ def run(binary, model):
                "no_proxy": "127.0.0.1,localhost"}
         env.update({key: "http://127.0.0.1:1" for key in
                     ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")})
+        if account_context:
+            env.pop("ANTHROPIC_API_KEY")
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = "public-offline-fixture-token"
+            config = Path(env["CLAUDE_CONFIG_DIR"])
+            config.mkdir()
+            (config / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": "public-fixture@example.invalid",
+                                 "accountUuid": "public-offline-account"},
+                "hasCompletedOnboarding": True}))
+        import admission
+        original_pin = admission.pin_message_breakpoint
+        observed_reminders = []
+
+        def observe(payload, queried):
+            observed_reminders.append(b"# userEmail" in payload)
+            return original_pin(payload, queried)
+
+        admission.pin_message_breakpoint = observe
         version = subprocess.check_output([str(binary), "--version"], env=env,
                                           stdin=subprocess.DEVNULL, text=True, timeout=15).strip()
         client = native.Client(command=str(binary), env=env, timeout=45)
         history = [{"role": "system", "content": "PUBLIC SYNTHETIC SYSTEM\n" * 300}]
-        for i in range(12):
+        for i in range(0 if opening else 12):
             history.extend([{"role": "user", "content": f"Public earlier question {i}"},
                             {"role": "assistant", "content": f"Public earlier answer {i}"}])
         history.append({"role": "user", "content": "Run the public probe."})
@@ -169,11 +190,21 @@ def run(binary, model):
                 else:
                     history.append({"role": "user", "content": f"Public followup {round_number}"})
             assert all("<total_tokens>" not in json.dumps(wire) for wire in peer.wires), "native budget reminder present"
-            assert sum(len(msg["content"]) for msg in peer.wires[0]["messages"]) > 20
+            if not opening:
+                assert sum(len(msg["content"]) for msg in peer.wires[0]["messages"]) > 20
+            if account_context:
+                assert all(observed_reminders), "synthetic account fixture did not trigger native reminders"
+                leaked = [i for i, w in enumerate(peer.wires)
+                          if "public-fixture@example.invalid" in json.dumps(w)]
+                assert not leaked, f"synthetic account email survived on rounds {leaked}"
+
             return {"native_version": version, "native_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                    "opening": opening, "account_context": account_context, "parallel": parallel,
+                    "native_reminders_observed": sum(observed_reminders),
                     "requests": len(peer.wires), "synthetic_usage_not_cache_measurement": True,
                     "cache_controls": markers, "prefix_receipts": receipts}
         finally:
+            admission.pin_message_breakpoint = original_pin
             client.close()
             peer.shutdown()
             worker.join()
@@ -183,5 +214,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--model", default="claude-sonnet-5")
+    parser.add_argument("--opening", action="store_true")
+    parser.add_argument("--account-context", action="store_true")
+    parser.add_argument("--parallel", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(run(args.binary.resolve(), args.model), indent=2))
+    print(json.dumps(run(args.binary.resolve(), args.model, args.opening, args.account_context, args.parallel), indent=2))
