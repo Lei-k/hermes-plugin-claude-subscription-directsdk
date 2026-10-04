@@ -6,6 +6,9 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
+
+import pytest
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +47,10 @@ assert sys.argv[sys.argv.index('--permission-mode')+1]=='dontAsk'
 assert sys.argv[sys.argv.index('--tools')+1]==''
 assert rows[-1]['type']=='user'
 assert 'metadata' not in wire
+if os.environ.get('EXPECT_CACHE_TTL'):
+ assert os.environ.get('CLAUDE_CODE_PROMPT_CACHE_TTL')==os.environ['EXPECT_CACHE_TTL']
+ assert os.environ.get('CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL')==os.environ['EXPECT_CACHE_TTL']
+ assert 'FORCE_PROMPT_CACHING_5M' not in os.environ
 blocks=[{'type':'thinking','thinking':'private','signature':'signed-test'}, {'type':'text','text':'hello\n'}, {'type':'tool_use','id':'toolu_test','name':'mcp__hermes__probe','input':{'value':'x'}}]
 if len(rows)>1:
  if rows[1]['message']['content'][0]['type']=='thinking':
@@ -59,6 +66,8 @@ for b in blocks:
 print(json.dumps({'type':'assistant','message':{'role':'assistant','content':blocks,'id':'msg_test','model':'sonnet','stop_reason':'tool_use' if len(blocks)>1 else 'end_turn'}}),flush=True)
 print(json.dumps({'type':'stream_event','event':{'type':'message_stop'}}),flush=True)
 u={'input_tokens':3,'output_tokens':5,'cache_read_input_tokens':7,'cache_creation_input_tokens':11,'output_tokens_details':{'thinking_tokens':4}}
+if 'CACHE_CREATION' in os.environ:
+ u['cache_creation']=json.loads(os.environ['CACHE_CREATION'])
 print(json.dumps({'type':'result','num_turns':2 if len(blocks)>1 else 1,'subtype':'error_max_turns' if len(blocks)>1 else 'success','is_error':len(blocks)>1,'usage':u,'total_cost_usd':.012345,'modelUsage':{'sonnet':{'costBasis':'list'}}}),flush=True)
 sys.exit(1 if len(blocks)>1 else 0)
 """
@@ -351,6 +360,291 @@ class Contract(unittest.TestCase):
         req["tools"][0]["function"]["parameters"] = {"anyOf": [{"type": "object"}]}
         bare = json.loads(directsdk.request_body(req)[0])["tools"][0]["input_schema"]
         self.assertEqual(bare, {"type": "object", "properties": {}})
+
+
+CACHE_TTL_KNOB = 'CLAUDE_SUBSCRIPTION_DIRECTSDK_CACHE_TTL'
+
+
+@pytest.mark.parametrize('policy', [None, '1h', '5m'])
+def test_cache_ttl_explicit_env_policy(tmp_path, policy):
+    fixture = Contract()
+    env = {'EXPECT_CACHE_TTL': policy or '1h', 'FORCE_PROMPT_CACHING_5M': '1',
+           'CLAUDE_CODE_PROMPT_CACHE_TTL': '5m', 'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL': '5m'}
+    if policy is not None:
+        env[CACHE_TTL_KNOB] = policy
+    client = fixture.client(tmp_path, **env)
+    try:
+        result = client.create(**fixture.request())
+        assert result.usage.model_dump()['native_cache_tiers']['requested_ttl'] == (policy or '1h')
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('policy', [None, '5m'])
+def test_cache_ttl_inherited_env_policy(tmp_path, policy):
+    fixture = Contract()
+    client = fixture.client(tmp_path)
+    client.env = None  # Exercise the normal inherited-environment conflict guard too.
+    env = {'PATH': os.environ['PATH'], 'HOME': str(tmp_path), 'EXPECT_CACHE_TTL': policy or '1h',
+           'FORCE_PROMPT_CACHING_5M': '1', 'CLAUDE_CODE_PROMPT_CACHE_TTL': '5m',
+           'CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL': '5m'}
+    if policy is not None:
+        env[CACHE_TTL_KNOB] = policy
+    try:
+        with patch.dict(os.environ, env, clear=True):
+            result = client.create(**fixture.request())
+        assert result.usage.model_dump()['native_cache_tiers']['requested_ttl'] == (policy or '1h')
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('explicit_policy', [None, '1h'])
+def test_cache_ttl_explicit_env_does_not_read_process_knob(tmp_path, explicit_policy):
+    fixture = Contract()
+    env = {'EXPECT_CACHE_TTL': '1h'}
+    if explicit_policy:
+        env[CACHE_TTL_KNOB] = explicit_policy
+    client = fixture.client(tmp_path, **env)
+    try:
+        with patch.dict(os.environ, {CACHE_TTL_KNOB: '5m'}):
+            result = client.create(**fixture.request())
+        assert result.usage.model_dump()['native_cache_tiers']['requested_ttl'] == '1h'
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('invalid', ['', '1H', 'unsafe-value@example.invalid'])
+def test_cache_ttl_invalid_warns_once_and_defaults_to_1h(tmp_path, caplog, invalid):
+    fixture = Contract()
+    client = fixture.client(tmp_path, EXPECT_CACHE_TTL='1h', **{CACHE_TTL_KNOB: invalid})
+    try:
+        with caplog.at_level('INFO', logger='directsdk'):
+            for _ in range(2):
+                result = client.create(**fixture.request())
+                assert result.usage.model_dump()['native_cache_tiers']['requested_ttl'] == '1h'
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+        assert warnings == [f'Invalid {CACHE_TTL_KNOB}; using 1h']
+        assert 'unsafe-value@example.invalid' not in caplog.text
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('source', ['delegated', 'cron'])
+def test_cache_ttl_query_sources_use_1h(tmp_path, source):
+    from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
+    fixture = Contract()
+    client = fixture.client(tmp_path, EXPECT_CACHE_TTL='1h', HERMES_DELEGATED_CHILD_CONTEXT='1')
+    context = delegated_child_context if source == 'delegated' else non_dispatcher_owned_context
+    try:
+        async def run():
+            with context():
+                result = await client.create(**fixture.request())
+            assert result.usage.model_dump()['native_cache_tiers']['requested_ttl'] == '1h'
+        asyncio.run(run())
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+@pytest.mark.parametrize('creation,expected', [
+    (None, {'write_5m': None, 'write_1h': None}),
+    ({'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 11}, {'write_5m': 0, 'write_1h': 11}),
+    ({'ephemeral_5m_input_tokens': 0}, {'write_5m': 0, 'write_1h': None}),
+    ({'ephemeral_1h_input_tokens': 0}, {'write_5m': None, 'write_1h': 0}),
+    ({'ephemeral_5m_input_tokens': 'unsafe-value@example.invalid', 'ephemeral_1h_input_tokens': -1},
+     {'write_5m': None, 'write_1h': None}),
+])
+def test_cache_tier_telemetry_counts_and_unknown(tmp_path, caplog, streaming, creation, expected):
+    fixture = Contract()
+    env = {} if creation is None else {'CACHE_CREATION': json.dumps(creation)}
+    client = fixture.client(tmp_path, **env)
+    try:
+        with caplog.at_level('INFO', logger='directsdk'):
+            result = client.create(**fixture.request(), stream=streaming)
+            final = list(result)[-1] if streaming else result
+        usage = final.usage.model_dump()
+        assert usage['native_cache_tiers'] == {'requested_ttl': '1h', **expected}
+        assert usage['native_usage'].get('cache_creation') == creation
+        info = [r.getMessage() for r in caplog.records if r.levelname == 'INFO']
+        count = lambda value: 'unknown' if value is None else str(value)
+        assert info == [f"DirectSDK cache tiers requested_ttl=1h write_5m={count(expected['write_5m'])} write_1h={count(expected['write_1h'])}"]
+        assert not [r for r in caplog.records if r.levelname == 'WARNING']
+        assert 'unsafe-value@example.invalid' not in caplog.text
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('requested', ['1h', '5m'])
+def test_cache_tier_mismatch_warns_once_per_client(tmp_path, caplog, requested):
+    fixture = Contract()
+    creation = {'ephemeral_5m_input_tokens': 3, 'ephemeral_1h_input_tokens': 8}
+    env = {CACHE_TTL_KNOB: requested, 'CACHE_CREATION': json.dumps(creation)}
+    client = fixture.client(tmp_path, **env)
+    try:
+        with caplog.at_level('INFO', logger='directsdk'):
+            for _ in range(2):
+                client.create(**fixture.request())
+        messages = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+        assert messages == [f'DirectSDK cache tier mismatch requested_ttl={requested} write_5m=3 write_1h=8']
+        assert len([r for r in caplog.records if r.levelname == 'INFO']) == 2
+    finally:
+        client.close()
+    # A new client can report its own first mismatch; there is no warning flood per call.
+    other = fixture.client(tmp_path, **env)
+    try:
+        caplog.clear()
+        with caplog.at_level('WARNING', logger='directsdk'):
+            other.create(**fixture.request())
+        assert len(caplog.records) == 1
+    finally:
+        other.close()
+
+
+def test_cache_tier_failed_native_call_records_unknown(tmp_path, caplog):
+    fixture = Contract()
+    client = fixture.client(tmp_path, NATIVE_ERROR='unknown:Public fixture failure')
+    try:
+        with caplog.at_level('INFO', logger='directsdk'), pytest.raises(RuntimeError, match='Public fixture failure'):
+            client.create(**fixture.request())
+        assert [r.getMessage() for r in caplog.records if r.levelname == 'INFO'] == [
+            'DirectSDK cache tiers requested_ttl=1h write_5m=unknown write_1h=unknown']
+    finally:
+        client.close()
+
+
+def test_cache_tier_concurrent_mismatch_warning_is_rate_limited(tmp_path, caplog):
+    from concurrent.futures import ThreadPoolExecutor
+    fixture = Contract()
+    client = fixture.client(tmp_path, CACHE_CREATION=json.dumps({'ephemeral_5m_input_tokens': 11}))
+    try:
+        with caplog.at_level('INFO', logger='directsdk'), ThreadPoolExecutor(max_workers=4) as pool:
+            results = [pool.submit(client.create, **fixture.request()) for _ in range(4)]
+            for result in results:
+                assert result.result(timeout=10).usage.model_dump()['native_cache_tiers']['write_5m'] == 11
+        assert len([r for r in caplog.records if r.levelname == 'INFO']) == 4
+        assert [r.getMessage() for r in caplog.records if r.levelname == 'WARNING'] == [
+            'DirectSDK cache tier mismatch requested_ttl=1h write_5m=11 write_1h=unknown']
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('failure', ['version', 'constructor'])
+def test_cache_wire_eval_restores_observer_on_setup_failure(tmp_path, monkeypatch, failure):
+    import admission
+    import importlib.util
+    import subprocess
+    import threading
+    spec = importlib.util.spec_from_file_location('cache_eval_fixture', ROOT / 'evals/directsdk_cache_wire.py')
+    eval = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(eval)
+    original_pin = admission.pin_message_breakpoint
+    original_threads = set(threading.enumerate())
+    if failure == 'version':
+        def fail(*args, **kwargs):
+            raise RuntimeError('Public fixture version failure')
+        monkeypatch.setattr(subprocess, 'check_output', fail)
+    else:
+        monkeypatch.setattr(subprocess, 'check_output', lambda *args, **kwargs: 'fixture version')
+        # The eval imports transport itself; fail that imported client's construction only.
+        from importlib.machinery import SourceFileLoader
+        original_load = SourceFileLoader.exec_module
+        def load(loader, module):
+            original_load(loader, module)
+            if module.__name__ == 'cache_directsdk':
+                def fail(*args, **kwargs):
+                    raise RuntimeError('Public fixture constructor failure')
+                module.Client = fail
+        monkeypatch.setattr(SourceFileLoader, 'exec_module', load)
+    with pytest.raises(RuntimeError, match='Public fixture'):
+        eval.run(tmp_path / 'not-a-binary', 'sonnet', account_context=True)
+    assert admission.pin_message_breakpoint is original_pin
+    assert set(threading.enumerate()) == original_threads
+
+
+@pytest.mark.parametrize('emission', ['info', 'mismatch_warning', 'invalid_warning'])
+@pytest.mark.parametrize('native_failure', [False, True])
+@pytest.mark.parametrize('streaming', [False, True])
+def test_cache_logging_failure_preserves_result_and_cleanup(tmp_path, monkeypatch, emission, native_failure, streaming):
+    import directsdk
+    import logging
+
+    prefixes = {'info': 'DirectSDK cache tiers', 'mismatch_warning': 'DirectSDK cache tier mismatch',
+                'invalid_warning': 'Invalid ' + CACHE_TTL_KNOB}
+    attempts = []
+    class BrokenHandler(logging.Handler):
+        def emit(self, record):
+            if record.getMessage().startswith(prefixes[emission]):
+                attempts.append(record.levelname)
+                raise OSError('Public fixture logging sink failure')
+
+    fixture = Contract()
+    env = {'EXPECT_CACHE_TTL': '1h'}
+    expected_error = 'Native API error: Public fixture native failure'
+    if emission == 'mismatch_warning':
+        env['CACHE_CREATION'] = json.dumps({'ephemeral_5m_input_tokens': 3, 'ephemeral_1h_input_tokens': 8})
+        # Fail after complete native usage is available so the mismatch warning is attempted too.
+        if native_failure:
+            expected_error = 'Native final text differs from incremental stream'
+    elif native_failure:
+        env['NATIVE_ERROR'] = 'unknown:Public fixture native failure'
+    if emission == 'invalid_warning':
+        env[CACHE_TTL_KNOB] = 'invalid'
+    client = fixture.client(tmp_path, **env)
+    if native_failure and emission == 'mismatch_warning':
+        (tmp_path / 'native.py').write_text(FAKE.replace("'text':b['text']", "'text':'Public fixture different text'"))
+
+    gates, processes = [], []
+    original_admission, original_spawn = directsdk.Admission, directsdk.Request.spawn
+    def gate(*args, **kwargs):
+        admission = original_admission(*args, **kwargs)
+        gates.append(admission)
+        return admission
+    def spawn(request, *args, **kwargs):
+        process = original_spawn(request, *args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(directsdk, 'Admission', gate)
+    monkeypatch.setattr(directsdk.Request, 'spawn', spawn)
+    handler = BrokenHandler()
+    original_level = directsdk.logger.level
+    directsdk.logger.addHandler(handler)
+    directsdk.logger.setLevel(logging.INFO)
+    try:
+        result = error = None
+        try:
+            result = client.create(**fixture.request(), stream=streaming)
+            if streaming:
+                result = list(result)[-1]._response
+        except Exception as exc:
+            error = exc
+        # Check lifecycle before any explicit fixture cleanup, including native pipe closure.
+        assert len(gates) == 1
+        assert all(not admission.thread.is_alive() and admission.server.fileno() == -1 for admission in gates)
+        assert not client._requests
+        assert len(processes) == 1
+        assert all(process.poll() is not None and process.stdin.closed and process.stdout.closed for process in processes)
+        assert attempts == ['INFO' if emission == 'info' else 'WARNING']
+        if native_failure:
+            assert type(error) is RuntimeError
+            assert str(error) == expected_error
+        else:
+            assert error is None
+            assert result.choices[0].message.content == 'hello\n'
+            assert result.choices[0].message.tool_calls[0].function.name == 'probe'
+    finally:
+        directsdk.logger.removeHandler(handler)
+        directsdk.logger.setLevel(original_level)
+        client.close()
+        # Clean up resources even on the RED transport, which skips its normal teardown.
+        for admission in gates:
+            if admission.thread.is_alive() or admission.server.fileno() != -1:
+                admission.close()
+        for process in processes:
+            directsdk.kill_process_tree(process)
+            process.wait(timeout=5)
+            for pipe in (process.stdin, process.stdout):
+                if pipe is not None and not pipe.closed:
+                    pipe.close()
 
 
 if __name__ == "__main__":

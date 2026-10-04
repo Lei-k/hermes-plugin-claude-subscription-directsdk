@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -40,6 +41,27 @@ class ClaudeCodeLoggedOut(RuntimeError):
 
 CARRIER = 'claude-subscription-directsdk-experimental.native_assistant'
 PREFIX = 'mcp__hermes__'
+logger = logging.getLogger(__name__)
+CACHE_TTL_ENV = 'CLAUDE_SUBSCRIPTION_DIRECTSDK_CACHE_TTL'
+
+
+def _cache_log(level, message, *args):
+    """A broken logging sink must not change request results, policy or cleanup."""
+    try:
+        logger.log(level, message, *args)
+    except Exception:
+        pass  # Reporting this failure through the same logger could fail again.
+
+
+def native_cache_tiers(usage, requested_ttl):
+    """Missing/invalid tier counters stay unknown; never log arbitrary native values."""
+    creation = usage.get('cache_creation')
+    creation = creation if isinstance(creation, dict) else {}
+    tiers = {'requested_ttl': requested_ttl}
+    for tier in ('5m', '1h'):
+        count = creation.get(f'ephemeral_{tier}_input_tokens')
+        tiers[f'write_{tier}'] = count if type(count) is int and count >= 0 else None
+    return tiers
 
 
 class Object(SimpleNamespace):
@@ -412,8 +434,32 @@ class Client:
         self.command = ([command] if isinstance(command, str) else list(command)) + list(args or [])
         self.timeout = timeout if isinstance(timeout, (int, float)) else 180
         self._lock, self._requests, self._closed = threading.Lock(), set(), False
+        self._cache_ttl_warned = self._cache_mismatch_warned = False
         self._owned_cwd = None
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    def _cache_ttl(self, env):
+        ttl = env.get(CACHE_TTL_ENV, '1h')
+        if ttl in ('1h', '5m'):
+            return ttl
+        with self._lock:
+            warn = not self._cache_ttl_warned
+            self._cache_ttl_warned = True
+        if warn:
+            _cache_log(logging.WARNING, 'Invalid %s; using 1h', CACHE_TTL_ENV)
+        return '1h'
+
+    def _log_cache_tiers(self, tiers):
+        ttl, five, hour = tiers['requested_ttl'], tiers['write_5m'], tiers['write_1h']
+        counts = (ttl, five if five is not None else 'unknown', hour if hour is not None else 'unknown')
+        _cache_log(logging.INFO, 'DirectSDK cache tiers requested_ttl=%s write_5m=%s write_1h=%s', *counts)
+        opposite = five if ttl == '1h' else hour
+        if opposite is not None and opposite > 0:
+            with self._lock:
+                warn = not self._cache_mismatch_warned
+                self._cache_mismatch_warned = True
+            if warn:
+                _cache_log(logging.WARNING, 'DirectSDK cache tier mismatch requested_ttl=%s write_5m=%s write_1h=%s', *counts)
 
     def cancel(self):
         """Fast cross-thread cancellation: signal owned groups; never close caller-thread FDs."""
@@ -498,6 +544,7 @@ class Client:
     def _run(self, request, kwargs, body, manifest, names, system, frames):
         p = None
         reader = None
+        cache_tiers = None
         try:
             timeout = kwargs.get('timeout', self.timeout)
             timeout = getattr(timeout, 'read', timeout)
@@ -510,6 +557,8 @@ class Client:
                 (root / 'tools.json').write_text(json.dumps(manifest), encoding='utf-8')
                 mcp = {'mcpServers': {'hermes': {'command': sys.executable, 'args': [str(Path(__file__).with_name('inert_mcp.py')), str(root / 'tools.json')]}}}
                 env = _with_windows_essentials(dict(self.env if self.env is not None else os.environ))
+                ttl = self._cache_ttl(env)
+                cache_tiers = native_cache_tiers({}, ttl)
                 if self.env is None:
                     conflicts = [key for key in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_FOUNDRY_API_KEY') if env.get(key)]
                     conflicts += [key for key in ('CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY') if env.get(key, '').lower() not in ('', '0', 'false', 'no', 'off')]
@@ -528,6 +577,10 @@ class Client:
                 env.update(ENABLE_TOOL_SEARCH='false', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1', CLAUDE_CODE_MAX_RETRIES='0', DISABLE_AUTO_COMPACT='1', DISABLE_COMPACT='1')
                 # Hermes owns budgets; native's replayed reminder invalidates cached history.
                 env['CLAUDE_CODE_TOTAL_TOKENS_REMINDER'] = 'off'
+                # One policy for main, delegated and cron queries, including explicit env fixtures.
+                # FORCE has higher native precedence than either TTL variable (CLI 2.1.283).
+                env.pop('FORCE_PROMPT_CACHING_5M', None)
+                env.update(CLAUDE_CODE_PROMPT_CACHE_TTL=ttl, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=ttl)
                 # The queried frame lets the relay keep the cache breakpoint off native's per-request context.
                 request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'])
                 env['ANTHROPIC_BASE_URL'] = request.admission.url
@@ -656,6 +709,7 @@ class Client:
                 usage = assistants[0]['usage'] if admission.used else final.get('usage')
                 if not isinstance(usage, dict) or not all(isinstance(usage.get(k), (int, float)) for k in ('input_tokens', 'output_tokens')):
                     raise RuntimeError('Native result missing complete token usage')
+                cache_tiers = native_cache_tiers(usage, ttl)
                 text = ''.join(b.get('text', '') for b in blocks if b.get('type') == 'text')
                 if emitted != text:
                     if text.startswith(emitted):
@@ -671,6 +725,7 @@ class Client:
                                     'completion_tokens_details': {'reasoning_tokens': usage.get('output_tokens_details', {}).get('thinking_tokens', 0)},
                                     'native_cost': {'total_cost_usd': final.get('total_cost_usd'), 'modelUsage': final.get('modelUsage')}}
                 normalized_usage['native_admission'] = {'upstream_requests': int(admission.used), 'blocked_requests': admission.denied, 'request_id': admission.request_id}
+                normalized_usage['native_cache_tiers'] = cache_tiers
                 finish = 'tool_calls' if calls else ('length' if any(a.get('stop_reason') in ('max_tokens', 'model_context_window_exceeded') for a in assistants) else 'stop')
                 response = obj({'id': assistants[-1].get('id', 'claude-native'), 'model': kwargs['model'], 'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}], 'usage': normalized_usage})
                 chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': [dict(tc, index=i) for i, tc in enumerate(calls)] or None, 'reasoning_details': [carrier]}, finish, normalized_usage)
@@ -689,6 +744,8 @@ class Client:
                         pipe.close()
             with self._lock:
                 self._requests.discard(request)
+            if cache_tiers is not None:
+                self._log_cache_tiers(cache_tiers)
 
     @staticmethod
     def _chunk(model, delta, finish=None, usage=None):

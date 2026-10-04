@@ -81,9 +81,44 @@ Auxiliary/fallback routing remains owned by Hermes. Configure those routes expli
 
 Each `chat.completions.create` starts a fresh process in a private temporary directory. Native tools, skills and setting sources are disabled. MCP advertises only the current Hermes tool inventory, has inert callbacks, and is denied execution by native `dontAsk`. Full descriptions and schemas are supplied through tools plus validated generation fields in `CLAUDE_CODE_EXTRA_BODY`, applied from a private native settings file; the system prompt uses a private file too. This avoids the OS per-argument/environment-string limit. Authentication and identity fields are never replaced.
 
-Canonical history is replayed in order. Historical user frames use `shouldQuery:false`, each with a zero-turn acknowledgment; the final user/tool-result frame queries. There is no parked native session or native approval wait, and the adapter adds no synthetic continue prompt. The local admission relay prevents native recovery from issuing another upstream request. The native token-budget reminder is disabled because Hermes owns budgets and replay reconstructs that reminder across the cache boundary. The relay removes only the recognized native account-email reminder when uniquely anchored to the complete Hermes frame; identical email/reminder text supplied by the user or a tool is retained. Unknown or ambiguous shapes are preserved, including combined reminders whose nonemail context cannot be separated by the recognized template. Other native annotations remain present, so the wire prompt is not byte-identical Hermes-only context. On the opening request, after email normalization, uniquely matched Hermes content is placed before any remaining native text preamble, so the cache breakpoint covers the replayable first turn (#77). This does not solve arbitrary parallel-tool prefix churn (#33), change native cache TTL, or establish cache/quota savings; offline usage counters are synthetic.
+Canonical history is replayed in order. Historical user frames use `shouldQuery:false`, each with a zero-turn acknowledgment; the final user/tool-result frame queries. There is no parked native session or native approval wait, and the adapter adds no synthetic continue prompt. The local admission relay prevents native recovery from issuing another upstream request. The native token-budget reminder is disabled because Hermes owns budgets and replay reconstructs that reminder across the cache boundary. The relay removes only the recognized native account-email reminder when uniquely anchored to the complete Hermes frame; identical email/reminder text supplied by the user or a tool is retained. Unknown or ambiguous shapes are preserved, including combined reminders whose nonemail context cannot be separated by the recognized template. Other native annotations remain present, so the wire prompt is not byte-identical Hermes-only context. On the opening request, after email normalization, uniquely matched Hermes content is placed before any remaining native text preamble, so the cache breakpoint covers the replayable first turn (#77). This does not solve arbitrary parallel-tool prefix churn (#33) or establish cache/quota savings; offline usage counters are synthetic.
 
 The relay binds an ephemeral loopback port with a random per-request route. Native authorization headers pass through memory directly to the upstream; headers are not logged or persisted. Native identity headers are preserved. The body receives the bounded reminder normalization and cache-breakpoint placement described above; HTTP transfer encoding is normalized. The relay captures streamed text, signed thinking, tool arguments, usage and stop reason before native recovery can replace them. Cancellation shuts down the active upstream connection and the native process; request teardown removes the listener. No external relay service or bundled vendor executable is required.
+
+### Prompt-cache TTL policy and telemetry
+
+The plugin requests **1h** for every query source, including main sessions, delegated children
+and cron. Set `CLAUDE_SUBSCRIPTION_DIRECTSDK_CACHE_TTL=5m` to request five minutes instead;
+the only accepted values are `1h` and `5m`. An invalid value warns once per client and uses
+`1h`; the invalid value is never logged. The native TTL controls require Claude Code
+**2.1.242+**; this policy is offline-qualified with **2.1.283**.
+
+For each child the plugin sets both `CLAUDE_CODE_PROMPT_CACHE_TTL` and
+`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL` to its policy and removes
+`FORCE_PROMPT_CACHING_5M`, which otherwise takes native precedence. Inherited native TTL
+variables cannot override the plugin policy. As with other environment handling, an explicit
+`Client(env=...)` uses that mapping exclusively for the knob; policy still overrides native
+TTL conflicts within it. No cache directives are added or moved by this policy.
+
+Response usage includes `native_cache_tiers: {requested_ttl, write_5m, write_1h}` from native
+`usage.cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`. Missing or
+invalid counters are `null` (unknown), while a reported zero remains zero. Existing usage
+and accounting fields are retained. Each started call emits a plugin-logger INFO line:
+
+```text
+DirectSDK cache tiers requested_ttl=1h write_5m=0 write_1h=123
+```
+
+Unknown counts appear as `unknown`; failed calls with no complete usage report unknown counts.
+A positive write count in the opposite tier emits
+`DirectSDK cache tier mismatch requested_ttl=1h write_5m=123 write_1h=0` at WARNING once per
+client, including under concurrent calls. These lines contain policy and counts only.
+They do not modify Hermes core or establish cache hits, subscription quota savings, or
+billing. See [Claude Code's TTL controls](https://code.claude.com/docs/en/prompt-caching#choose-the-ttl-yourself).
+
+The offline eval checks raw directives and effective TTL: native 2.1.283 emits `ttl: "1h"`
+for one hour, and omits `ttl` for the [documented five-minute ephemeral default](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+Synthetic peer counters are not real service tier measurements.
 
 ### Long-context caching qualification
 
@@ -166,6 +201,8 @@ Token usage retains native uncached/cache-read/cache-write/output components. Co
 python evals/directsdk_admission.py /path/to/claude
 python evals/directsdk_cache_wire.py /path/to/claude
 python evals/directsdk_cache_wire.py /path/to/claude --opening --account-context --parallel
+python evals/directsdk_cache_wire.py /path/to/claude --opening --account-context --parallel --force-5m
+python evals/directsdk_cache_wire.py /path/to/claude --opening --account-context --parallel --cache-ttl 5m --force-5m
 ```
 
 Transport invariant tests cover signed replay and harmless normalization, transformed projections, final tool batches/usage, async use, lazy failure, invalid parameters, conflicting auth, and active/paused/unstarted stream cleanup. The admission regression fails on the previous implementation (two upstream requests) and passes with one request, preserving first-response usage including zero values. Its cancellation control verifies upstream socket closure. A real-native ten-case loopback qualification covers normal text, tools, output/context limits, thinking-only recovery, refusal, HTTP errors, disconnects and cancellation, with one upstream request per call. Its responses are synthetic protocol fixtures, not paid-model evidence.

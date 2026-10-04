@@ -34,9 +34,12 @@ print(json.dumps({'type':'result','subtype':'success','usage':{'input_tokens':0,
 
 
 @pytest.mark.parametrize('stop', ['end_turn', 'max_tokens', 'model_context_window_exceeded'])
-def test_first_response_owns_usage_and_stops_recovery(tmp_path, stop):
+@pytest.mark.parametrize('creation', [None, {'ephemeral_5m_input_tokens': 0, 'ephemeral_1h_input_tokens': 0}])
+def test_first_response_owns_usage_and_stops_recovery(tmp_path, stop, creation):
     calls = []
     usage = {'input_tokens':0, 'output_tokens':0, 'cache_read_input_tokens':0, 'cache_creation_input_tokens':0}
+    if creation is not None:
+        usage['cache_creation'] = creation
     class Peer(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
         def do_POST(self):
@@ -62,6 +65,9 @@ def test_first_response_owns_usage_and_stops_recovery(tmp_path, stop):
         assert result.choices[0].message.content=='FIRST'
         assert result.choices[0].finish_reason==('stop' if stop=='end_turn' else 'length')
         assert result.usage.prompt_tokens==0
+        assert result.usage.model_dump()['native_cache_tiers'] == {
+            'requested_ttl': '1h', 'write_5m': None if creation is None else 0,
+            'write_1h': None if creation is None else 0}
         assert result.choices[0].message.reasoning_details[0]['messages'][0]['stop_reason']==stop
     finally:
         client.close(); peer.shutdown(); thread.join(); peer.server_close()
