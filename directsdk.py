@@ -723,9 +723,19 @@ class Client:
                         # A name outside the inventory (a hallucinated or deferred tool) goes to Hermes as is: its
                         # turn validation answers that call with an error the model corrects. Raising here instead
                         # failed the whole turn after three retries, reported as an unavailable provider.
-                        name = block['name']
-                        if name.startswith(PREFIX):
-                            name = name[len(PREFIX):]
+                        # Hermes dispatches only its valid_tool_names, built from the same tool list this request
+                        # carries as `names` (its name repair also maps only into that set), so a name outside
+                        # `names` gets an error result and never runs a tool this request did not offer.
+                        native_name = block['name']
+                        offered = native_name.startswith(PREFIX) and native_name[len(PREFIX):] in names
+                        if offered:
+                            name = native_name[len(PREFIX):]
+                        else:
+                            # An offered name without the prefix (native dropped it) passes unchanged; anything
+                            # else is Hermes' to reject, in the host's namespace when native kept the prefix.
+                            name = native_name if native_name in names else native_name.removeprefix(PREFIX)
+                            # Name only: arguments may carry user data. A broken log sink never fails the turn.
+                            _cache_log(logging.WARNING, 'DirectSDK native tool call outside the offered inventory: %r; handed to Hermes as %r', native_name[:80], name[:80])
                         calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and p.returncode == 1
                 if not boundary and not native_failure_handled and (p.returncode != 0 or final.get('is_error') or final.get('subtype') != 'success'):

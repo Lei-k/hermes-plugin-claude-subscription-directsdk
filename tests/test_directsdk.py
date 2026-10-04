@@ -52,6 +52,8 @@ if os.environ.get('EXPECT_CACHE_TTL'):
  assert os.environ.get('CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL')==os.environ['EXPECT_CACHE_TTL']
  assert 'FORCE_PROMPT_CACHING_5M' not in os.environ
 blocks=[{'type':'thinking','thinking':'private','signature':'signed-test'}, {'type':'text','text':'hello\n'}, {'type':'tool_use','id':'toolu_test','name':os.environ.get('TOOL_NAME','mcp__hermes__probe'),'input':{'value':'x'}}]
+for i,n in enumerate(json.loads(os.environ.get('EXTRA_TOOL_NAMES','[]'))):
+ blocks.append({'type':'tool_use','id':'toolu_extra_%d'%i,'name':n,'input':{'value':'fixture-argument-%d'%i}})
 if len(rows)>1:
  if rows[1]['message']['content'][0]['type']=='thinking':
   assert rows[1]['message']['content']==blocks
@@ -659,6 +661,195 @@ def test_cache_logging_failure_preserves_result_and_cleanup(tmp_path, monkeypatc
             for pipe in (process.stdin, process.stdout):
                 if pipe is not None and not pipe.closed:
                     pipe.close()
+
+
+OUTSIDE_WARNING = 'DirectSDK native tool call outside the offered inventory: %r; handed to Hermes as %r'
+# (name native emitted, name Hermes receives); the request offers only `probe`.
+OUTSIDE_NAMES = [
+    ('mcp__fastmail__draft_email', 'mcp__fastmail__draft_email'),  # bare MCP name (#39: deferred tool called directly)
+    ('Bash', 'Bash'),                                              # a native built-in, never offered (--tools '')
+    ('mcp__hermes__ghost', 'ghost'),                               # inert-server prefix, name not in the inventory
+    ('probe', 'probe'),                                            # offered name with the prefix dropped (#62)
+]
+
+
+def _tool_calls(result, streaming):
+    if streaming:
+        chunks = list(result)
+        calls = [tc for c in chunks if c.choices for tc in (c.choices[0].delta.tool_calls or [])]
+        return chunks[-1]._response, calls
+    return result, result.choices[0].message.tool_calls
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+@pytest.mark.parametrize('native_name,host_name', OUTSIDE_NAMES)
+def test_outside_inventory_call_reaches_hermes_beside_a_valid_parallel_call(tmp_path, caplog, streaming, native_name, host_name):
+    fixture = Contract()
+    client = fixture.client(tmp_path, EXTRA_TOOL_NAMES=json.dumps([native_name]))
+    try:
+        with caplog.at_level('INFO', logger='directsdk'):
+            response, calls = _tool_calls(client.create(**fixture.request(), stream=streaming), streaming)
+        assert response.choices[0].finish_reason == 'tool_calls'
+        assert [(c.id, c.function.name) for c in calls] == [('toolu_test', 'probe'), ('toolu_extra_0', host_name)]
+        assert json.loads(calls[1].function.arguments) == {'value': 'fixture-argument-0'}
+        # The rejected name, once, and nothing from its arguments.
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+        assert warnings == [OUTSIDE_WARNING % (native_name, host_name)]
+        assert 'fixture-argument' not in caplog.text
+        # Replay is unchanged: the carrier keeps native's own blocks, and the next round
+        # (Hermes' error result for the unknown call) replays them verbatim (FAKE asserts it).
+        message = response.choices[0].message.model_dump()
+        carried = [b['name'] for m in message['reasoning_details'][0]['messages'] for b in m['content'] if b['type'] == 'tool_use']
+        assert carried == ['mcp__hermes__probe', native_name]
+        message['content'] = (message['content'] or '').strip()
+        request = fixture.request()
+        request['messages'] += [message, {'role': 'tool', 'tool_call_id': 'toolu_test', 'content': 'ok'},
+                                {'role': 'tool', 'tool_call_id': 'toolu_extra_0',
+                                 'content': f"Tool '{host_name}' does not exist. Available tools: probe"}]
+        assert client.create(**request).choices[0].message.content == 'done'
+    finally:
+        client.close()
+
+
+def test_outside_inventory_warns_once_per_occurrence(tmp_path, caplog):
+    fixture = Contract()
+    client = fixture.client(tmp_path, EXTRA_TOOL_NAMES=json.dumps(['Bash', 'mcp__hermes__ghost']))
+    try:
+        with caplog.at_level('WARNING', logger='directsdk'):
+            for _ in range(2):
+                names = [c.function.name for c in client.create(**fixture.request()).choices[0].message.tool_calls]
+                assert names == ['probe', 'Bash', 'ghost']
+        assert [r.getMessage() for r in caplog.records] == 2 * [
+            OUTSIDE_WARNING % ('Bash', 'Bash'), OUTSIDE_WARNING % ('mcp__hermes__ghost', 'ghost')]
+    finally:
+        client.close()
+
+
+def test_offered_names_map_exactly_before_any_prefix_strip(tmp_path, caplog):
+    # A host tool may itself be named mcp__hermes__* (an MCP server called "hermes"): an exact
+    # inventory match wins, so a dropped outer prefix still names the offered tool.
+    fixture = Contract()
+    request = fixture.request()
+    request['tools'].append({'type': 'function', 'function': {'name': 'mcp__hermes__note', 'parameters': {'type': 'object'}}})
+    client = fixture.client(tmp_path, EXTRA_TOOL_NAMES=json.dumps(['mcp__hermes__mcp__hermes__note', 'mcp__hermes__note']))
+    try:
+        with caplog.at_level('WARNING', logger='directsdk'):
+            names = [c.function.name for c in client.create(**request).choices[0].message.tool_calls]
+        assert names == ['probe', 'mcp__hermes__note', 'mcp__hermes__note']
+        assert [r.getMessage() for r in caplog.records] == [OUTSIDE_WARNING % ('mcp__hermes__note', 'mcp__hermes__note')]
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+def test_outside_inventory_logging_failure_cannot_break_the_turn(tmp_path, monkeypatch, streaming):
+    import directsdk
+    import logging
+
+    attempts = []
+    class BrokenHandler(logging.Handler):
+        def emit(self, record):
+            if record.getMessage().startswith('DirectSDK native tool call outside'):
+                attempts.append(record.levelname)
+                raise OSError('Public fixture logging sink failure')
+
+    processes, original_spawn = [], directsdk.Request.spawn
+    def spawn(request, *args, **kwargs):
+        process = original_spawn(request, *args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(directsdk.Request, 'spawn', spawn)
+    fixture = Contract()
+    client = fixture.client(tmp_path, EXTRA_TOOL_NAMES=json.dumps(['Bash']))
+    handler, original_level = BrokenHandler(), directsdk.logger.level
+    directsdk.logger.addHandler(handler)
+    directsdk.logger.setLevel(logging.INFO)
+    try:
+        response, calls = _tool_calls(client.create(**fixture.request(), stream=streaming), streaming)
+        assert attempts == ['WARNING']
+        assert [c.function.name for c in calls] == ['probe', 'Bash']
+        assert response.choices[0].message.content == 'hello\n'
+        assert not client._requests
+        assert len(processes) == 1 and processes[0].poll() is not None and processes[0].stdout.closed
+    finally:
+        directsdk.logger.removeHandler(handler)
+        directsdk.logger.setLevel(original_level)
+        client.close()
+
+
+# A native that answers the first query with the tool calls in LOOP_TOOLS, then "done";
+# it records every stdin frame so the test can read what the second request replayed.
+LOOP_NATIVE = r"""
+import json, os, sys
+rows=[]
+for line in sys.stdin:
+ r=json.loads(line); rows.append(r)
+ if r.get('shouldQuery') is False:
+  print(json.dumps({'type':'result','num_turns':0,'is_error':False}),flush=True)
+with open(os.environ['ROWS_FILE'],'a') as f:
+ f.write(json.dumps(rows)+'\n')
+if len(rows)==1:
+ blocks=[{'type':'tool_use','id':'toolu_loop_%d'%i,'name':n,'input':{'query':'fixture-argument'}} for i,n in enumerate(json.loads(os.environ['LOOP_TOOLS']))]
+else:
+ blocks=[{'type':'text','text':'done'}]
+ print(json.dumps({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'done'}}}),flush=True)
+tool=blocks[0]['type']=='tool_use'
+print(json.dumps({'type':'assistant','message':{'role':'assistant','content':blocks,'id':'msg_loop','model':'sonnet','stop_reason':'tool_use' if tool else 'end_turn'}}),flush=True)
+print(json.dumps({'type':'stream_event','event':{'type':'message_stop'}}),flush=True)
+print(json.dumps({'type':'result','num_turns':1,'subtype':'error_max_turns' if tool else 'success','is_error':tool,'usage':{'input_tokens':1,'output_tokens':1}}),flush=True)
+sys.exit(1 if tool else 0)
+"""
+
+
+@pytest.mark.parametrize('with_valid_call', [True, False])
+def test_hermes_loop_errors_unoffered_calls_and_runs_only_offered_tools(tmp_path, monkeypatch, with_valid_call):
+    """The real Hermes turn loop on this transport. Tool Search defers `todo_list`, so it is a
+    registered Hermes tool that this request did not offer: a direct call to it, a native
+    built-in and a foreign MCP name must each get Hermes' unknown-tool result and never run,
+    while an offered call in the same batch does run and the turn completes."""
+    import directsdk
+    import model_tools
+    from run_agent import AIAgent
+
+    home = tmp_path / 'hermes-home'
+    home.mkdir()
+    (home / 'config.yaml').write_text('tools:\n  tool_search:\n    enabled: "on"\n    defer: [todo_list]\n', encoding='utf-8')
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    unoffered = ['Bash', 'mcp__hermes__todo_list', 'mcp__fastmail__draft_email']
+    native = (['mcp__hermes__tool_search'] if with_valid_call else []) + unoffered
+    script, rows_file = tmp_path / 'loop_native.py', tmp_path / 'rows.jsonl'
+    script.write_text(LOOP_NATIVE)
+    client = directsdk.Client(command=[sys.executable, str(script)], env={
+        'PATH': os.environ['PATH'], 'HOME': str(tmp_path), 'LOOP_TOOLS': json.dumps(native), 'ROWS_FILE': str(rows_file)})
+    dispatched = []
+    def dispatch(name, *args, **kwargs):
+        dispatched.append(name)  # Record only: no Hermes tool really runs in this test.
+        return json.dumps({'ok': True})
+    monkeypatch.setattr(model_tools, 'handle_function_call', dispatch)
+    agent = AIAgent(base_url='http://127.0.0.1:9/v1', api_key='fixture', model='sonnet', enabled_toolsets=['todo'],
+                    quiet_mode=True, skip_context_files=True, skip_memory=True, skip_background_review=True,
+                    checkpoints_enabled=False, load_soul_identity=False, max_iterations=4)
+    try:
+        assert 'tool_search' in agent.valid_tool_names and 'todo_list' not in agent.valid_tool_names
+        from tools.registry import registry
+        assert registry.get_entry('todo_list') is not None  # registered, just not offered
+        monkeypatch.setattr(agent, '_create_request_openai_client', lambda **_: client)
+        monkeypatch.setattr(agent, '_close_request_openai_client', lambda *_, **__: None)
+        result = agent.run_conversation('go')
+        assert result['completed'] is True and result['final_response'] == 'done'
+        assert dispatched == (['tool_search'] if with_valid_call else [])
+        results = {m['tool_call_id']: m['content'] for m in result['messages'] if m.get('role') == 'tool'}
+        offset = int(with_valid_call)
+        for i, name in enumerate(['Bash', 'todo_list', 'mcp__fastmail__draft_email']):
+            assert results[f'toolu_loop_{i + offset}'].startswith(f"Tool '{name}' does not exist. Available tools: ")
+        # The model sees each error in the next request, so it can correct itself.
+        replayed = json.loads(rows_file.read_text().splitlines()[-1])
+        sent = {b['tool_use_id']: b['content'] for r in replayed if r['type'] == 'user'
+                for b in r['message']['content'] if b.get('type') == 'tool_result'}
+        assert sent == results
+    finally:
+        agent.close()
+        client.close()
 
 
 if __name__ == "__main__":
