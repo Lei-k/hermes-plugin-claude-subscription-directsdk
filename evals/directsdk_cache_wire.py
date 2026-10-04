@@ -4,7 +4,8 @@ Run: python3 evals/directsdk_cache_wire.py /absolute/path/to/claude
 Add --opening --account-context --parallel for the synthetic OAuth first-turn regression.
 Uses the real DirectSDK and native binary, with a synthetic loopback Messages peer.
 Checks exact cached-prefix reuse, not cache hit rates; usage is deliberately synthetic.
-Only compact hash receipts go to stdout. No raw traces or fixtures are retained.
+Add --cache-ttl 5m or --force-5m to qualify the plugin TTL policy.
+Only compact hash/count/directive receipts go to stdout. No raw traces or fixtures are retained.
 """
 import argparse
 import copy
@@ -102,7 +103,7 @@ class Peer(BaseHTTPRequestHandler):
         emit({"type": "message_stop"})
 
 
-def run(binary, model, opening=False, account_context=False, parallel=False):
+def run(binary, model, opening=False, account_context=False, parallel=False, cache_ttl=None, force_5m=False):
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root))
     spec = importlib.util.spec_from_file_location(
@@ -122,6 +123,12 @@ def run(binary, model, opening=False, account_context=False, parallel=False):
                "no_proxy": "127.0.0.1,localhost"}
         env.update({key: "http://127.0.0.1:1" for key in
                     ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")})
+        if cache_ttl is not None:
+            env['CLAUDE_SUBSCRIPTION_DIRECTSDK_CACHE_TTL'] = cache_ttl
+        requested_ttl = cache_ttl or '1h'
+        if force_5m:
+            env.update(FORCE_PROMPT_CACHING_5M='1', CLAUDE_CODE_PROMPT_CACHE_TTL='5m',
+                       CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL='5m')
         if account_context:
             env.pop("ANTHROPIC_API_KEY")
             env["CLAUDE_CODE_OAUTH_TOKEN"] = "public-offline-fixture-token"
@@ -140,16 +147,17 @@ def run(binary, model, opening=False, account_context=False, parallel=False):
             return original_pin(payload, queried)
 
         admission.pin_message_breakpoint = observe
-        version = subprocess.check_output([str(binary), "--version"], env=env,
-                                          stdin=subprocess.DEVNULL, text=True, timeout=15).strip()
-        client = native.Client(command=str(binary), env=env, timeout=45)
-        history = [{"role": "system", "content": "PUBLIC SYNTHETIC SYSTEM\n" * 300}]
-        for i in range(0 if opening else 12):
-            history.extend([{"role": "user", "content": f"Public earlier question {i}"},
-                            {"role": "assistant", "content": f"Public earlier answer {i}"}])
-        history.append({"role": "user", "content": "Run the public probe."})
-        receipts, previous = [], None
+        client = None
         try:
+            version = subprocess.check_output([str(binary), "--version"], env=env,
+                                              stdin=subprocess.DEVNULL, text=True, timeout=15).strip()
+            client = native.Client(command=str(binary), env=env, timeout=45)
+            history = [{"role": "system", "content": "PUBLIC SYNTHETIC SYSTEM\n" * 300}]
+            for i in range(0 if opening else 12):
+                history.extend([{"role": "user", "content": f"Public earlier question {i}"},
+                                {"role": "assistant", "content": f"Public earlier answer {i}"}])
+            history.append({"role": "user", "content": "Run the public probe."})
+            receipts, previous = [], None
             for round_number in range(6):
                 # Pure tool continuation, then ordinary user turns, then tools again.
                 peer.tools = round_number not in (2, 3)
@@ -164,6 +172,10 @@ def run(binary, model, opening=False, account_context=False, parallel=False):
                                    for j, block in enumerate(msg["content"]) if "cache_control" in block]
                 assert len(markers) <= 4 and len(message_markers) == 1, "extra cache breakpoints"
                 assert all(marker == markers[0] for marker in markers), "mixed native cache TTLs"
+                # Native 2.1.283 omits ttl for the documented 5m ephemeral default.
+                effective_ttls = [marker.get('ttl', '5m') for marker in markers]
+                assert all(marker.get('type') == 'ephemeral' for marker in markers)
+                assert effective_ttls and all(ttl == requested_ttl for ttl in effective_ttls), "native ignored requested TTL"
                 prompt = content({key: wire[key] for key in ("tools", "system", "messages")})
                 if previous is not None:
                     old, old_markers, (i, j) = previous
@@ -202,10 +214,13 @@ def run(binary, model, opening=False, account_context=False, parallel=False):
                     "opening": opening, "account_context": account_context, "parallel": parallel,
                     "native_reminders_observed": sum(observed_reminders),
                     "requests": len(peer.wires), "synthetic_usage_not_cache_measurement": True,
-                    "cache_controls": markers, "prefix_receipts": receipts}
+                    "requested_ttl": requested_ttl, "inherited_force_5m": force_5m,
+                    "cache_controls": markers, "effective_cache_ttls": effective_ttls,
+                    "prefix_receipts": receipts}
         finally:
             admission.pin_message_breakpoint = original_pin
-            client.close()
+            if client is not None:
+                client.close()
             peer.shutdown()
             worker.join()
 
@@ -217,5 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--opening", action="store_true")
     parser.add_argument("--account-context", action="store_true")
     parser.add_argument("--parallel", action="store_true")
+    parser.add_argument('--cache-ttl', choices=('1h', '5m'), help='Plugin policy (unset defaults to 1h)')
+    parser.add_argument('--force-5m', action='store_true', help='Inject conflicting native FORCE/TTL overrides')
     args = parser.parse_args()
-    print(json.dumps(run(args.binary.resolve(), args.model, args.opening, args.account_context, args.parallel), indent=2))
+    print(json.dumps(run(args.binary.resolve(), args.model, args.opening, args.account_context, args.parallel, args.cache_ttl, args.force_5m), indent=2))
