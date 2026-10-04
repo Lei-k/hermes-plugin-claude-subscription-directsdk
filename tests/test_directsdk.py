@@ -561,5 +561,91 @@ def test_cache_wire_eval_restores_observer_on_setup_failure(tmp_path, monkeypatc
     assert set(threading.enumerate()) == original_threads
 
 
+@pytest.mark.parametrize('emission', ['info', 'mismatch_warning', 'invalid_warning'])
+@pytest.mark.parametrize('native_failure', [False, True])
+@pytest.mark.parametrize('streaming', [False, True])
+def test_cache_logging_failure_preserves_result_and_cleanup(tmp_path, monkeypatch, emission, native_failure, streaming):
+    import directsdk
+    import logging
+
+    prefixes = {'info': 'DirectSDK cache tiers', 'mismatch_warning': 'DirectSDK cache tier mismatch',
+                'invalid_warning': 'Invalid ' + CACHE_TTL_KNOB}
+    attempts = []
+    class BrokenHandler(logging.Handler):
+        def emit(self, record):
+            if record.getMessage().startswith(prefixes[emission]):
+                attempts.append(record.levelname)
+                raise OSError('Public fixture logging sink failure')
+
+    fixture = Contract()
+    env = {'EXPECT_CACHE_TTL': '1h'}
+    expected_error = 'Native API error: Public fixture native failure'
+    if emission == 'mismatch_warning':
+        env['CACHE_CREATION'] = json.dumps({'ephemeral_5m_input_tokens': 3, 'ephemeral_1h_input_tokens': 8})
+        # Fail after complete native usage is available so the mismatch warning is attempted too.
+        if native_failure:
+            expected_error = 'Native final text differs from incremental stream'
+    elif native_failure:
+        env['NATIVE_ERROR'] = 'unknown:Public fixture native failure'
+    if emission == 'invalid_warning':
+        env[CACHE_TTL_KNOB] = 'invalid'
+    client = fixture.client(tmp_path, **env)
+    if native_failure and emission == 'mismatch_warning':
+        (tmp_path / 'native.py').write_text(FAKE.replace("'text':b['text']", "'text':'Public fixture different text'"))
+
+    gates, processes = [], []
+    original_admission, original_spawn = directsdk.Admission, directsdk.Request.spawn
+    def gate(*args, **kwargs):
+        admission = original_admission(*args, **kwargs)
+        gates.append(admission)
+        return admission
+    def spawn(request, *args, **kwargs):
+        process = original_spawn(request, *args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(directsdk, 'Admission', gate)
+    monkeypatch.setattr(directsdk.Request, 'spawn', spawn)
+    handler = BrokenHandler()
+    original_level = directsdk.logger.level
+    directsdk.logger.addHandler(handler)
+    directsdk.logger.setLevel(logging.INFO)
+    try:
+        result = error = None
+        try:
+            result = client.create(**fixture.request(), stream=streaming)
+            if streaming:
+                result = list(result)[-1]._response
+        except Exception as exc:
+            error = exc
+        # Check lifecycle before any explicit fixture cleanup, including native pipe closure.
+        assert len(gates) == 1
+        assert all(not admission.thread.is_alive() and admission.server.fileno() == -1 for admission in gates)
+        assert not client._requests
+        assert len(processes) == 1
+        assert all(process.poll() is not None and process.stdin.closed and process.stdout.closed for process in processes)
+        assert attempts == ['INFO' if emission == 'info' else 'WARNING']
+        if native_failure:
+            assert type(error) is RuntimeError
+            assert str(error) == expected_error
+        else:
+            assert error is None
+            assert result.choices[0].message.content == 'hello\n'
+            assert result.choices[0].message.tool_calls[0].function.name == 'probe'
+    finally:
+        directsdk.logger.removeHandler(handler)
+        directsdk.logger.setLevel(original_level)
+        client.close()
+        # Clean up resources even on the RED transport, which skips its normal teardown.
+        for admission in gates:
+            if admission.thread.is_alive() or admission.server.fileno() != -1:
+                admission.close()
+        for process in processes:
+            directsdk.kill_process_tree(process)
+            process.wait(timeout=5)
+            for pipe in (process.stdin, process.stdout):
+                if pipe is not None and not pipe.closed:
+                    pipe.close()
+
+
 if __name__ == "__main__":
     unittest.main()

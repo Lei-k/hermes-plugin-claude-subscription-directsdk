@@ -45,6 +45,14 @@ logger = logging.getLogger(__name__)
 CACHE_TTL_ENV = 'CLAUDE_SUBSCRIPTION_DIRECTSDK_CACHE_TTL'
 
 
+def _cache_log(level, message, *args):
+    """A broken logging sink must not change request results, policy or cleanup."""
+    try:
+        logger.log(level, message, *args)
+    except Exception:
+        pass  # Reporting this failure through the same logger could fail again.
+
+
 def native_cache_tiers(usage, requested_ttl):
     """Missing/invalid tier counters stay unknown; never log arbitrary native values."""
     creation = usage.get('cache_creation')
@@ -438,20 +446,20 @@ class Client:
             warn = not self._cache_ttl_warned
             self._cache_ttl_warned = True
         if warn:
-            logger.warning('Invalid %s; using 1h', CACHE_TTL_ENV)
+            _cache_log(logging.WARNING, 'Invalid %s; using 1h', CACHE_TTL_ENV)
         return '1h'
 
     def _log_cache_tiers(self, tiers):
         ttl, five, hour = tiers['requested_ttl'], tiers['write_5m'], tiers['write_1h']
         counts = (ttl, five if five is not None else 'unknown', hour if hour is not None else 'unknown')
-        logger.info('DirectSDK cache tiers requested_ttl=%s write_5m=%s write_1h=%s', *counts)
+        _cache_log(logging.INFO, 'DirectSDK cache tiers requested_ttl=%s write_5m=%s write_1h=%s', *counts)
         opposite = five if ttl == '1h' else hour
         if opposite is not None and opposite > 0:
             with self._lock:
                 warn = not self._cache_mismatch_warned
                 self._cache_mismatch_warned = True
             if warn:
-                logger.warning('DirectSDK cache tier mismatch requested_ttl=%s write_5m=%s write_1h=%s', *counts)
+                _cache_log(logging.WARNING, 'DirectSDK cache tier mismatch requested_ttl=%s write_5m=%s write_1h=%s', *counts)
 
     def cancel(self):
         """Fast cross-thread cancellation: signal owned groups; never close caller-thread FDs."""
@@ -724,8 +732,6 @@ class Client:
                 chunk._response = response
                 yield chunk
         finally:
-            if cache_tiers is not None:
-                self._log_cache_tiers(cache_tiers)
             request.cancel()
             if request.admission is not None:
                 request.admission.close()
@@ -738,6 +744,8 @@ class Client:
                         pipe.close()
             with self._lock:
                 self._requests.discard(request)
+            if cache_tiers is not None:
+                self._log_cache_tiers(cache_tiers)
 
     @staticmethod
     def _chunk(model, delta, finish=None, usage=None):
