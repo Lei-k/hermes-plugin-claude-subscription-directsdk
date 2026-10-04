@@ -95,6 +95,23 @@ profile = ClaudeOAuthDirectSDKProfile(
     fallback_models=tuple(MODEL_METADATA),
     model_aliases={alias: native_model(alias) for alias in ALIASES},
 )
+
+
+def classify_api_error(error, **_):
+    """Hermes asks this for this provider's failures before its built-in classifier.
+
+    A native tool call outside the offered inventory (directsdk.ClaudeToolOutsideInventory) is the
+    model's own output for this request, so do not replay it three times; a configured fallback may
+    still answer. A bare 400 is not used: Hermes reads a generic 400 in a large session as context
+    overflow and compresses. Every other error keeps Hermes' own classification."""
+    if getattr(error, 'failure_kind', None) == 'tool_outside_inventory':
+        return {'reason': 'format_error', 'retryable': False, 'should_fallback': True}
+    return None
+
+
+# Assigned, not passed to the constructor: a Hermes without this profile field still loads the
+# plugin and classifies the error as before (retried, then fallback).
+profile.classify_api_error = classify_api_error
 register_provider(profile)
 
 # The provider stays registered when Claude Code is missing so `hermes model` can show the

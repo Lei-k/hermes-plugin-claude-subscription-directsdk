@@ -47,6 +47,16 @@ class ClaudeAPIError(RuntimeError):
         self.status_code = status_code
 
 
+class ClaudeToolOutsideInventory(ClaudeAPIError):
+    """Native named a tool this request did not offer exactly once (unknown, or claimed by two offered names).
+
+    Never handed to Hermes: its turn validation repairs an unknown name onto an offered tool by
+    normalization or fuzzy match, which would run a different tool with these arguments. The
+    provider profile classifies this as a non-retryable request error; a configured fallback
+    still applies. The message names the tool only, never its arguments."""
+    failure_kind = 'tool_outside_inventory'
+
+
 CARRIER = 'claude-subscription-directsdk-experimental.native_assistant'
 PREFIX = 'mcp__hermes__'
 logger = logging.getLogger(__name__)
@@ -720,22 +730,27 @@ class Client:
                 calls = []
                 for block in blocks:
                     if block.get('type') == 'tool_use':
-                        # A name outside the inventory (a hallucinated or deferred tool) goes to Hermes as is: its
-                        # turn validation answers that call with an error the model corrects. Raising here instead
-                        # failed the whole turn after three retries, reported as an unavailable provider.
-                        # Hermes dispatches only its valid_tool_names, built from the same tool list this request
-                        # carries as `names` (its name repair also maps only into that set), so a name outside
-                        # `names` gets an error result and never runs a tool this request did not offer.
+                        # Hermes gets only a name that is exactly one offered tool. Its turn validation repairs
+                        # any other name onto an offered tool (normalization, fuzzy match) and dispatches it
+                        # with these arguments, so an unknown or ambiguous name fails closed here instead.
                         native_name = block['name']
-                        offered = native_name.startswith(PREFIX) and native_name[len(PREFIX):] in names
-                        if offered:
-                            name = native_name[len(PREFIX):]
-                        else:
-                            # An offered name without the prefix (native dropped it) passes unchanged; anything
-                            # else is Hermes' to reject, in the host's namespace when native kept the prefix.
-                            name = native_name if native_name in names else native_name.removeprefix(PREFIX)
-                            # Name only: arguments may carry user data. A broken log sink never fails the turn.
-                            _cache_log(logging.WARNING, 'DirectSDK native tool call outside the offered inventory: %r; handed to Hermes as %r', native_name[:80], name[:80])
+                        offered = set()
+                        if native_name.startswith(PREFIX) and native_name[len(PREFIX):] in names:
+                            offered.add(native_name[len(PREFIX):])  # the route native was offered
+                        if native_name in names:
+                            offered.add(native_name)  # an offered name with the prefix dropped (#62)
+                        # Name only, never arguments: they may carry user data. A broken log sink never
+                        # changes the outcome (non-throwing emission from #2).
+                        if len(offered) != 1:
+                            shown = native_name[:80]
+                            _cache_log(logging.WARNING, 'DirectSDK native tool call %s: %r; failing closed',
+                                       'matches two offered tools' if offered else 'outside the offered inventory', shown)
+                            raise ClaudeToolOutsideInventory(
+                                f'Native returned an ambiguous tool name: {shown!r} matches two offered tools' if offered
+                                else f'Native returned a tool outside the current host inventory: {shown!r}')
+                        name = offered.pop()
+                        if name == native_name:
+                            _cache_log(logging.WARNING, 'DirectSDK native tool call without the %s prefix: %r; handed to Hermes as the offered tool', PREFIX, name[:80])
                         calls.append({'id': block['id'], 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(block['input'], separators=(',', ':'), allow_nan=False)}})
                 boundary = bool(calls) and final.get('subtype') == 'error_max_turns' and p.returncode == 1
                 if not boundary and not native_failure_handled and (p.returncode != 0 or final.get('is_error') or final.get('subtype') != 'success'):
