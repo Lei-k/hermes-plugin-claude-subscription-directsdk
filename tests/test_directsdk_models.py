@@ -3,6 +3,8 @@ import json
 import os
 import sys
 
+import pytest
+
 from test_directsdk import FAKE
 
 EXPECTED = {
@@ -26,20 +28,27 @@ def test_catalog_windows_match_explicit_native_routes(profile):
     # Unpinned: the plain id runs natively within the 200K gateway default; [1m] promises nothing.
     assert profile.get_model_context_length('unqualified-future-model') == 200_000
     assert profile.get_model_context_length('unqualified-future-model[1m]') is None
+    assert profile.get_model_context_length('claude-opus-9-9') == 200_000
+    assert get_model_context_length('claude-opus-9-9', provider=profile.name) == 200_000
 
 
-def test_native_argv_enables_only_known_long_context_models(profile, tmp_path):
+@pytest.mark.parametrize('streaming', [False, True])
+def test_native_argv_enables_only_known_long_context_models(profile, tmp_path, streaming):
     capture = tmp_path / 'argv.json'
     native = tmp_path / 'native.py'
     native.write_text(FAKE.replace('rows=[]', "pathlib.Path(os.environ['ARGV_CAPTURE']).write_text(json.dumps(sys.argv))\nrows=[]"))
     aliases = {'sonnet':'claude-sonnet-5[1m]', 'opus':'claude-opus-5-5[1m]',
                'haiku':'claude-haiku-4-5-20251001', 'fable':'claude-fable-5-1[1m]',
-               'unqualified-future-model':'unqualified-future-model'}
+               'sonnet[1m]':'claude-sonnet-5[1m]', 'opus[1m]':'claude-opus-5-5[1m]',
+               'fable[1m]':'claude-fable-5-1[1m]', 'claude-haiku-4-5':'claude-haiku-4-5-20251001',
+               'claude-opus-9-9':'claude-opus-9-9', 'claude-opus-9-9[1m]':'claude-opus-9-9[1m]'}
     with_client = profile.create_client(command=[sys.executable,str(native)], env={'PATH':os.defpath,'HOME':str(tmp_path),'ARGV_CAPTURE':str(capture)})
     try:
         for requested, expected in {**{m:m for m in EXPECTED}, **aliases}.items():
-            with_client.create(model=requested, messages=[{'role':'user','content':'fixture'}],
+            result = with_client.create(model=requested, messages=[{'role':'user','content':'fixture'}], stream=streaming,
                                tools=[{'type':'function','function':{'name':'probe','description':'TAIL','parameters':{'type':'object','properties':{'value':{'type':'string'}}}}}])
+            if streaming:
+                list(result)
             argv = json.loads(capture.read_text())
             assert argv[argv.index('--model')+1] == expected and '--effort' not in argv
     finally:

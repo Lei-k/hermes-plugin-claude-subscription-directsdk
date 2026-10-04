@@ -39,6 +39,14 @@ class ClaudeCodeLoggedOut(RuntimeError):
     """Claude Code refused before any upstream request because it has no usable login where Hermes runs it."""
 
 
+class ClaudeAPIError(RuntimeError):
+    """A request rejection carrying the status Hermes uses for retry and fallback."""
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 CARRIER = 'claude-subscription-directsdk-experimental.native_assistant'
 PREFIX = 'mcp__hermes__'
 logger = logging.getLogger(__name__)
@@ -525,6 +533,14 @@ class Client:
         system, frames = prepare_history(kwargs.get('messages', []))
         if not isinstance(kwargs.get('model'), str) or not kwargs['model']:
             raise ValueError('model is required')
+        # Resolve known aliases, but never require a catalog pin or a discovery probe:
+        # a brand-new claude-* id must retain its bare native route and 200K window.
+        if not native_model(kwargs['model']).startswith('claude-'):
+            # A generic 404 can still be retryable in Hermes. "Model not found" names
+            # the deterministic wrong-provider route and selects its fallback verdict.
+            raise ClaudeAPIError(
+                f"Model not found for provider claude-subscription-directsdk-experimental: {kwargs['model']!r}; "
+                'expected a Claude model id or known alias', status_code=404)
         request = Request(self)
         with self._lock:
             if self._closed:
