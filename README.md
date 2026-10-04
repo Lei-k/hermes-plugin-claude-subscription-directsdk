@@ -181,14 +181,18 @@ The picker exposes these explicit native routes:
 
 Short names `sonnet`, `haiku`, `opus` and `fable` resolve to the corresponding pinned routes above. Known 1M model IDs also receive the native `[1m]` suffix automatically; Haiku does not. Unknown Claude model IDs pass through unchanged and are never promised 1M: a plain one reports the 200K window native Claude Code applies to an unverifiable id behind the relay, so Hermes' own family-name guess (which would size `claude-opus-5-5` at 1M before it was pinned) cannot budget past it; an unknown `[1m]` id reports nothing, and no Hermes estimate for it exceeds the native 1M. An explicit Hermes `model.context_length` still overrides the host's window, including a smaller compaction budget.
 
-A request id is clearly non-Claude when `model_catalog.native_model()` resolves it to an id
-that does not start with `claude-`. Known aliases (including supported `[1m]` forms) resolve
-first; any new `claude-*` id is accepted without a catalog pin or discovery lookup. Non-Claude
+A request id is clearly non-Claude when a stripped, case-folded copy, with any `[1m]` suffix
+removed case-insensitively, neither starts with `claude-` nor names a known plugin or CLI alias.
+The guard accepts `default`, `best`, `opusplan`, and the plugin aliases, including case variants
+and `[1m]` forms. Normalization only affects this check: native argv keeps the existing spelling
+and routing. Any new `claude-*` id is accepted without a catalog pin or discovery lookup. Non-Claude
 ids such as `gpt-6-astra` fail before request files, admission or native startup with
 `ClaudeAPIError(RuntimeError)`, `status_code=404`, and a message naming the id and provider.
 The status describes a model absent from this provider; the explicit `Model not found` text
 makes Hermes classify it as non-retryable `model_not_found`, allowing configured fallback on
-the first error. Discovery still lists every CLI-advertised model. Other HTTP/native error
+the first error. Vendor-prefixed Claude ids are rejected with a hint to drop the vendor prefix.
+The CLI aliases follow [Claude Code's model alias list](https://code.claude.com/docs/en/model-config#model-aliases).
+Discovery still lists every CLI-advertised model. Other HTTP/native error
 propagation remains unchanged.
 
 The local relay sets `ANTHROPIC_BASE_URL`, which makes Claude Code apply its gateway defaults. Its documented Sonnet 5 gateway default is 200K unless `[1m]` is selected; this was the cause of the earlier downgrade, not evidence of a general subscription limit. Both native argv and Hermes metadata now select the same window. See [Claude Code model configuration](https://code.claude.com/docs/en/model-config#sonnet-5-context-window).

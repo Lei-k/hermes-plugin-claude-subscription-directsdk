@@ -14,7 +14,7 @@ from test_directsdk_admission import NATIVE
 
 @pytest.mark.parametrize('model', [
     'gpt-6-astra', 'gpt-5.6-sol', 'gpt-6.1-sol', 'gpt-6-sol',
-    'gpt-6-astra[1m]', 'gemini-3-pro', 'default',
+    'gpt-6-astra[1m]', 'gemini-3-pro', ' GPT-6-ASTRA[1M] ',
 ])
 @pytest.mark.parametrize('streaming', [False, True])
 @pytest.mark.parametrize('asynchronous', [False, True])

@@ -19,9 +19,10 @@ as too large, but this conversation is only 128K" error that blames the server.
   `200_000`. Returning `None` for a plain id is a regression, whatever the reason.
   `tests/test_directsdk_models.py::test_catalog_windows_match_explicit_native_routes` guards it;
   do not weaken the unpinned assertions.
-- `native_model()` appends `[1m]` only for ids pinned at 1M. An unpinned id is sent bare and
-  reported as 200K. A user typing a brand-new id gets a working 200K session, never a broken
-  1M one.
+- `native_model()` appends `[1m]` only for ids pinned at 1M. Unpinned plain `claude-*` ids and
+  known aliases outside the pinned routes are sent bare and reported as 200K. A user typing
+  a brand-new `claude-*` id gets a working 200K session, never a broken 1M one. Non-Claude ids
+  are refused before native (#3); the profile still answers 200K for every unpinned plain id.
 - Discovery lists every model the CLI advertises; the pinned table adds metadata only. Never
   filter the picker down to the table.
 
@@ -35,6 +36,7 @@ window and which plans include it; the model table for the minimum CLI version).
 1. `model_catalog.py::CONTEXT_WINDOWS` — canonical id (hyphenated, as the CLI spells it) and
    window from the docs. Do not copy a window from a sibling model.
 2. `ALIASES` — move the family alias (`opus`, `sonnet`, `fable`, `haiku`) when the docs move it.
+   A first-party id not starting with `claude-` also needs the request guard in `directsdk.py` updated.
 3. `MANDATORY_THINKING` / `NO_ADAPTIVE_THINKING` if the docs say thinking cannot be turned off
    or adaptive thinking 400s (Fable and Haiku 4.5 today). Mirror what
    `agent/anthropic_adapter.py` in hermes-agent encodes; if the two disagree, fix both. Open

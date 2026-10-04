@@ -42,6 +42,12 @@ def test_native_argv_enables_only_known_long_context_models(profile, tmp_path, s
                'sonnet[1m]':'claude-sonnet-5[1m]', 'opus[1m]':'claude-opus-5-5[1m]',
                'fable[1m]':'claude-fable-5-1[1m]', 'claude-haiku-4-5':'claude-haiku-4-5-20251001',
                'claude-opus-9-9':'claude-opus-9-9', 'claude-opus-9-9[1m]':'claude-opus-9-9[1m]'}
+    # The guard normalizes a copy; argv retains native_model's existing spelling.
+    aliases.update({model: model for model in (
+        'default', 'best', 'opusplan', 'Opus', 'SONNET', 'Claude-Opus-5-5', 'opus[1M]',
+        ' DEFAULT ', ' Best[1M] ', 'OPUSPLAN[1M]', ' Haiku ', ' Fable[1M] ',
+        ' claude-opus-9-9 ', 'Claude-Opus-9-9[1M]',
+    )})
     with_client = profile.create_client(command=[sys.executable,str(native)], env={'PATH':os.defpath,'HOME':str(tmp_path),'ARGV_CAPTURE':str(capture)})
     try:
         for requested, expected in {**{m:m for m in EXPECTED}, **aliases}.items():
@@ -53,3 +59,18 @@ def test_native_argv_enables_only_known_long_context_models(profile, tmp_path, s
             assert argv[argv.index('--model')+1] == expected and '--effort' not in argv
     finally:
         with_client.close()
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+@pytest.mark.parametrize('model', ['anthropic/claude-opus-5-5', 'anthropic.claude-opus-5-5',
+                                 'us.anthropic.claude-opus-5-5', ' Anthropic/Claude-Opus-5-5 '])
+def test_vendor_prefixed_claude_id_suggests_dropping_prefix(profile, model, streaming):
+    client = profile.create_client(command='unused-offline-native', env={})
+    try:
+        with pytest.raises(RuntimeError, match='drop the vendor prefix') as raised:
+            client.create(model=model, messages=[{'role': 'user', 'content': 'fixture'}], stream=streaming)
+        assert raised.value.status_code == 404
+        assert model in str(raised.value) and profile.name in str(raised.value)
+        assert not client._requests and client._owned_cwd is None
+    finally:
+        client.close()
