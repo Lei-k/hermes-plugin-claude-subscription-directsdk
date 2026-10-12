@@ -30,6 +30,10 @@ _ACCOUNT_REMINDER = re.compile(
     r"URL, or payload, unless the user explicitly asks\.)?"
     r"(?:\n\nIMPORTANT: this context may or may not be relevant to your tasks\. You should "
     r"not respond to this context unless it is highly relevant to your task\.)?"
+    # Native 2.1.296 appends this attribution paragraph inside the same reminder (#13).
+    r"(?:\n\nClaude Code attached this context automatically; it isn't part of the user's "
+    r"message\. It describes the user's own account and workspace, so they don't need it "
+    r"reported back\.)?"
     r"\n</system-reminder>\n?")
 
 
