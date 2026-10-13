@@ -167,3 +167,41 @@ def test_ambiguous_normalizable_frame_and_changed_tool_identity_fail_safe():
     for content in ([host, changed], [{**changed, 'tool_use_id': 'different'}]):
         raw = wire([{'role': 'user', 'content': content}])
         assert pin_message_breakpoint(raw, [host]) == raw
+
+
+NATIVE_2_1_296 = {'type': 'text', 'text': (
+    "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n"
+    "# userEmail\nThe user's email address is a@example.invalid. Use it only to identify the user, "
+    "such as for authorship, attribution, or filtering their own work. Never send it to an "
+    "unrelated service, such as in a request header, URL, or payload, unless the user explicitly "
+    "asks.\n\nClaude Code attached this context automatically; it isn't part of the user's "
+    "message. It describes the user's own account and workspace, so they don't need it reported "
+    "back.\n</system-reminder>\n")}
+
+
+@pytest.mark.parametrize('placement', ['standalone_after', 'text_suffix', 'tool_suffix'])
+def test_native_2_1_296_account_reminder_is_removed(placement):
+    """#13: the 2.1.296 attribution paragraph must not hide the reminder from the relay."""
+    first = {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'unaltered'}
+    host = ({'type': 'tool_result', 'tool_use_id': 't2', 'content': 'result'}
+            if placement == 'tool_suffix' else FRAME)
+    queried = [first, host]
+    if placement == 'standalone_after':
+        # Marked reminder blocks are deliberately preserved; mark the host block instead.
+        sent = [first, {**host, 'cache_control': MARKER}, NATIVE_2_1_296]
+    else:
+        field = 'content' if placement == 'tool_suffix' else 'text'
+        sent = [first, {**host, field: host[field] + '\n\n' + NATIVE_2_1_296['text'],
+                        'cache_control': MARKER}]
+    messages = [{'role': 'assistant', 'content': [{'type': 'text', 'text': 'tools'}]},
+                {'role': 'user', 'content': sent}]
+    out = json.loads(pin_message_breakpoint(wire(messages), queried))
+    assert plain(out['messages'][1]['content']) == queried
+    assert 'a@example.invalid' not in json.dumps(out)
+
+
+def test_native_2_1_296_variant_with_extra_text_is_preserved():
+    altered = NATIVE_2_1_296['text'].replace('reported back.', 'reported back. Extra.')
+    changed = {**FRAME, 'text': FRAME['text'] + '\n\n' + altered, 'cache_control': MARKER}
+    raw = wire([{'role': 'user', 'content': [changed]}])
+    assert pin_message_breakpoint(raw, [FRAME]) == raw
