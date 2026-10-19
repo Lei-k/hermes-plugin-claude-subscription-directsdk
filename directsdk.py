@@ -23,10 +23,12 @@ from types import SimpleNamespace
 
 try:
     from .admission import Admission
+    from . import prefix_diag
     from .model_catalog import ALIASES, accepts_thinking_disable, native_model, supports_adaptive_thinking
     from .directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude
 except ImportError:
     from admission import Admission
+    import prefix_diag
     from model_catalog import ALIASES, accepts_thinking_disable, native_model, supports_adaptive_thinking
     from directsdk_setup import INSTALL_HINT, LOGGED_OUT_HINT, _resolve as resolve_claude
 
@@ -574,7 +576,60 @@ class Client:
         finally:
             stream.close()
 
+    def _diag_start(self, kwargs, body, system, frames):
+        """Content-free host/frame fingerprints when #17 diagnostics are enabled, else None."""
+        try:
+            if prefix_diag.target() is None:
+                return None
+            with self._lock:
+                self._diag_seq = getattr(self, '_diag_seq', 0) + 1
+                seq = self._diag_seq
+            sid = None
+            try:
+                import hermes_logging
+                sid = getattr(hermes_logging._session_context, 'session_id', None)
+            except Exception:
+                pass
+            return {'v': 1, 'ts': prefix_diag.now(), 'client': f'{os.getpid()}:{id(self):x}', 'seq': seq,
+                    'sid': sid, 'model': kwargs.get('model'),
+                    'body': prefix_diag.fingerprint(json.loads(body)),
+                    'host': prefix_diag.host_layer(kwargs.get('messages')),
+                    'frames': prefix_diag.frames_layer(system, frames)}
+        except Exception:
+            return None
+
+    def _diag_finish(self, record, request, usage, error):
+        if record is None:
+            return
+        try:
+            admission = request.admission
+            record['wire'] = getattr(admission, 'diag_wire', None)
+            record['status'] = getattr(admission, 'status', None)
+            record['error'] = type(error).__name__ if error is not None else None
+            if isinstance(usage, dict):
+                record['usage'] = {k: usage.get(k) for k in ('input_tokens', 'output_tokens',
+                                   'cache_read_input_tokens', 'cache_creation_input_tokens')}
+            record['done'] = prefix_diag.now()
+            prefix_diag.write(record)
+        except Exception:
+            pass
+
     def _run(self, request, kwargs, body, manifest, names, system, frames):
+        diag = self._diag_start(kwargs, body, system, frames)
+        diag_usage = diag_error = None
+        try:
+            yield from self._run_inner(request, kwargs, body, manifest, names, system, frames, diag)
+        except GeneratorExit:
+            raise  # The consumer closed the stream (normal after the final chunk).
+        except BaseException as error:
+            diag_error = error
+            raise
+        finally:
+            if diag is not None:
+                diag_usage = diag.pop('_usage', None)
+                self._diag_finish(diag, request, diag_usage, diag_error)
+
+    def _run_inner(self, request, kwargs, body, manifest, names, system, frames, diag=None):
         p = None
         reader = None
         cache_tiers = None
@@ -615,7 +670,7 @@ class Client:
                 env.pop('FORCE_PROMPT_CACHING_5M', None)
                 env.update(CLAUDE_CODE_PROMPT_CACHE_TTL=ttl, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=ttl)
                 # The queried frame lets the relay keep the cache breakpoint off native's per-request context.
-                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'])
+                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'], diag=diag is not None)
                 env['ANTHROPIC_BASE_URL'] = request.admission.url
                 # Native settings apply env inside the process, avoiding execve's
                 # per-argument/environment-string limit for full Hermes schemas.
@@ -761,6 +816,8 @@ class Client:
                 if not isinstance(usage, dict) or not all(isinstance(usage.get(k), (int, float)) for k in ('input_tokens', 'output_tokens')):
                     raise RuntimeError('Native result missing complete token usage')
                 cache_tiers = native_cache_tiers(usage, ttl)
+                if diag is not None:
+                    diag['_usage'] = usage
                 text = ''.join(b.get('text', '') for b in blocks if b.get('type') == 'text')
                 if emitted != text:
                     if text.startswith(emitted):

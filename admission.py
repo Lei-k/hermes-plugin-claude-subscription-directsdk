@@ -12,6 +12,11 @@ import ssl
 import threading
 from urllib.parse import urlsplit
 
+try:
+    from . import prefix_diag
+except ImportError:
+    import prefix_diag
+
 
 UNCACHEABLE = ('thinking', 'redacted_thinking')
 
@@ -257,9 +262,11 @@ class Capture:
 
 
 class Admission:
-    def __init__(self, upstream, timeout, queried=None):
+    def __init__(self, upstream, timeout, queried=None, diag=False):
         self.upstream = urlsplit(upstream)
         self.queried = queried
+        self.diag = diag
+        self.diag_wire = None
         host = self.upstream.hostname
         try:
             local = ipaddress.ip_address(host).is_loopback
@@ -337,7 +344,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.connection.settimeout(gate.timeout)
             payload = self.rfile.read(int(self.headers['Content-Length']))
+            raw = payload
             payload = pin_message_breakpoint(payload, gate.queried)
+            if gate.diag:
+                # Content-free block hashes only (#17); never alters the forwarded body.
+                try:
+                    gate.diag_wire = {'native': prefix_diag.wire_layer(raw),
+                                      'forwarded': None if payload is raw else prefix_diag.wire_layer(payload)}
+                except Exception:
+                    gate.diag_wire = None
+            del raw
             target = gate.upstream
             if target.scheme == 'https':
                 conn = http.client.HTTPSConnection(target.hostname, target.port, timeout=gate.timeout, context=ssl.create_default_context())
