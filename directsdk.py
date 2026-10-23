@@ -671,7 +671,8 @@ class Client:
                 env.update(CLAUDE_CODE_PROMPT_CACHE_TTL=ttl, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=ttl)
                 # The queried frame lets the relay keep the cache breakpoint off native's per-request context;
                 # the workdir lets it pin native's ancestor-dependent git line for that directory (#17).
-                workdir = self._workdir()
+                # Canonical form: native reports its getcwd(), which resolves a symlinked TMPDIR.
+                workdir = os.path.realpath(self._workdir())
                 request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'], diag=diag is not None, workdir=workdir)
                 env['ANTHROPIC_BASE_URL'] = request.admission.url
                 # Native settings apply env inside the process, avoiding execve's

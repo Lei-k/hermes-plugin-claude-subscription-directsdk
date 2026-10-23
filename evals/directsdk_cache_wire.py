@@ -144,8 +144,12 @@ def run(binary, model, opening=False, account_context=False, parallel=False, cac
         original_pin = admission.pin_message_breakpoint
         observed_reminders = []
 
+        raw_git = []
+
         def observe(payload, queried, *rest):
             observed_reminders.append(b"# userEmail" in payload)
+            # Content-free: what native itself said before the relay normalized it.
+            raw_git.append(b"Is a git repository: true" in payload)
             return original_pin(payload, queried, *rest)
 
         admission.pin_message_breakpoint = observe
@@ -234,6 +238,7 @@ def run(binary, model, opening=False, account_context=False, parallel=False, cac
                          for line in json.dumps(message["content"]).split("\\n")
                          if "Is a git repository" in line]
                 assert any(git_rounds) and lines, "ancestor .git fixture did not reach native's environment block"
+                assert raw_git == git_rounds, f"native did not observe the ancestor .git flip: {raw_git} != {git_rounds}"
                 assert all(line.endswith("Is a git repository: false") for line in lines), "workdir git line flipped"
                 assert all(workdir in json.dumps(wire) for wire in peer.wires), "native did not run in the confined workdir"
             return {"native_version": version, "native_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
@@ -242,7 +247,8 @@ def run(binary, model, opening=False, account_context=False, parallel=False, cac
                     "requests": len(peer.wires), "synthetic_usage_not_cache_measurement": True,
                     "requested_ttl": requested_ttl, "inherited_force_5m": force_5m,
                     "cache_controls": markers, "effective_cache_ttls": effective_ttls,
-                    "ancestor_git_rounds": git_rounds, "prefix_receipts": receipts}
+                    "ancestor_git_rounds": git_rounds, "native_git_true": raw_git,
+                    "prefix_receipts": receipts}
         finally:
             tempfile.tempdir = original_tempdir
             admission.pin_message_breakpoint = original_pin

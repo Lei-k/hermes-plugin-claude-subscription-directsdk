@@ -168,11 +168,17 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'usage': {'input_token
 
 
 @pytest.mark.skipif(not hasattr(os, 'getuid'), reason='the shared workspace is keyed by the POSIX uid')
-def test_client_relays_its_own_workdir(tmp_path, monkeypatch):
+@pytest.mark.parametrize('symlinked', [False, True])
+def test_client_relays_its_own_workdir(tmp_path, monkeypatch, symlinked):
     root = tmp_path / 'tmp'
     root.mkdir(mode=0o700)
     (root / '.git').mkdir()  # The unrelated ancestor .git that flips native's answer.
-    monkeypatch.setattr(directsdk.tempfile, 'tempdir', str(root))
+    tempdir = root
+    if symlinked:
+        # A TMPDIR reached through a symlink: native reports the canonical getcwd().
+        tempdir = tmp_path / 'tmp-link'
+        tempdir.symlink_to(root, target_is_directory=True)
+    monkeypatch.setattr(directsdk.tempfile, 'tempdir', str(tempdir))
     bodies = []
     usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
 
@@ -210,7 +216,7 @@ def test_client_relays_its_own_workdir(tmp_path, monkeypatch):
         peer.shutdown()
         thread.join()
         peer.server_close()
-    workdir = str(root / f'claude-directsdk-cwd-{os.getuid()}')
+    workdir = os.path.realpath(root / f'claude-directsdk-cwd-{os.getuid()}')
     assert len(bodies) == 1
     env = bodies[0]['messages'][1]['content']
     assert f'Primary working directory: {workdir}\n - Is a git repository: false\n' in env
