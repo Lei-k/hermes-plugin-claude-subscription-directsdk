@@ -5,6 +5,7 @@ Add --opening --account-context --parallel for the synthetic OAuth first-turn re
 Uses the real DirectSDK and native binary, with a synthetic loopback Messages peer.
 Checks exact cached-prefix reuse, not cache hit rates; usage is deliberately synthetic.
 Add --cache-ttl 5m or --force-5m to qualify the plugin TTL policy.
+Add --ancestor-git to toggle an unrelated .git above the native workdir between rounds (#17).
 Only compact hash/count/directive receipts go to stdout. No raw traces or fixtures are retained.
 """
 import argparse
@@ -103,7 +104,8 @@ class Peer(BaseHTTPRequestHandler):
         emit({"type": "message_stop"})
 
 
-def run(binary, model, opening=False, account_context=False, parallel=False, cache_ttl=None, force_5m=False):
+def run(binary, model, opening=False, account_context=False, parallel=False, cache_ttl=None, force_5m=False,
+        ancestor_git=False):
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root))
     spec = importlib.util.spec_from_file_location(
@@ -142,12 +144,24 @@ def run(binary, model, opening=False, account_context=False, parallel=False, cac
         original_pin = admission.pin_message_breakpoint
         observed_reminders = []
 
-        def observe(payload, queried):
+        raw_git = []
+
+        def observe(payload, queried, *rest):
             observed_reminders.append(b"# userEmail" in payload)
-            return original_pin(payload, queried)
+            # Content-free: what native itself said before the relay normalized it.
+            raw_git.append(b"Is a git repository: true" in payload)
+            return original_pin(payload, queried, *rest)
 
         admission.pin_message_breakpoint = observe
         client = None
+        # The shared workdir lives under tempfile.gettempdir(); confine it to this run's tree so the
+        # toggled .git never touches the real temp directory other processes use.
+        scratch = Path(tmp) / "scratch"
+        scratch.mkdir(mode=0o700)
+        original_tempdir = tempfile.tempdir
+        if ancestor_git:
+            tempfile.tempdir = str(scratch)
+        git_rounds = []
         try:
             version = subprocess.check_output([str(binary), "--version"], env=env,
                                               stdin=subprocess.DEVNULL, text=True, timeout=15).strip()
@@ -161,6 +175,14 @@ def run(binary, model, opening=False, account_context=False, parallel=False, cac
             for round_number in range(6):
                 # Pure tool continuation, then ordinary user turns, then tools again.
                 peer.tools = round_number not in (2, 3)
+                if ancestor_git:
+                    # An unrelated .git appears above the workdir for two rounds, then disappears.
+                    marker = scratch / ".git"
+                    if round_number in (2, 3):
+                        marker.mkdir(exist_ok=True)
+                    elif marker.exists():
+                        marker.rmdir()
+                    git_rounds.append(marker.exists())
                 original = copy.deepcopy(history)
                 start = len(peer.wires)
                 result = client.create(model=model, messages=history, tools=TOOLS)
@@ -210,14 +232,25 @@ def run(binary, model, opening=False, account_context=False, parallel=False, cac
                           if "public-fixture@example.invalid" in json.dumps(w)]
                 assert not leaked, f"synthetic account email survived on rounds {leaked}"
 
+            if ancestor_git:
+                workdir = str(scratch / f"claude-directsdk-cwd-{os.getuid()}")
+                lines = [line for wire in peer.wires for message in wire["messages"] if message["role"] == "system"
+                         for line in json.dumps(message["content"]).split("\\n")
+                         if "Is a git repository" in line]
+                assert any(git_rounds) and lines, "ancestor .git fixture did not reach native's environment block"
+                assert raw_git == git_rounds, f"native did not observe the ancestor .git flip: {raw_git} != {git_rounds}"
+                assert all(line.endswith("Is a git repository: false") for line in lines), "workdir git line flipped"
+                assert all(workdir in json.dumps(wire) for wire in peer.wires), "native did not run in the confined workdir"
             return {"native_version": version, "native_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                     "opening": opening, "account_context": account_context, "parallel": parallel,
                     "native_reminders_observed": sum(observed_reminders),
                     "requests": len(peer.wires), "synthetic_usage_not_cache_measurement": True,
                     "requested_ttl": requested_ttl, "inherited_force_5m": force_5m,
                     "cache_controls": markers, "effective_cache_ttls": effective_ttls,
+                    "ancestor_git_rounds": git_rounds, "native_git_true": raw_git,
                     "prefix_receipts": receipts}
         finally:
+            tempfile.tempdir = original_tempdir
             admission.pin_message_breakpoint = original_pin
             if client is not None:
                 client.close()
@@ -234,5 +267,7 @@ if __name__ == "__main__":
     parser.add_argument("--parallel", action="store_true")
     parser.add_argument('--cache-ttl', choices=('1h', '5m'), help='Plugin policy (unset defaults to 1h)')
     parser.add_argument('--force-5m', action='store_true', help='Inject conflicting native FORCE/TTL overrides')
+    parser.add_argument('--ancestor-git', action='store_true', help='Toggle an unrelated .git above the workdir (#17)')
     args = parser.parse_args()
-    print(json.dumps(run(args.binary.resolve(), args.model, args.opening, args.account_context, args.parallel, args.cache_ttl, args.force_5m), indent=2))
+    print(json.dumps(run(args.binary.resolve(), args.model, args.opening, args.account_context, args.parallel, args.cache_ttl, args.force_5m,
+                         args.ancestor_git), indent=2))
