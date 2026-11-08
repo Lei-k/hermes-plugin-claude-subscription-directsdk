@@ -669,8 +669,11 @@ class Client:
                 # FORCE has higher native precedence than either TTL variable (CLI 2.1.283).
                 env.pop('FORCE_PROMPT_CACHING_5M', None)
                 env.update(CLAUDE_CODE_PROMPT_CACHE_TTL=ttl, CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=ttl)
-                # The queried frame lets the relay keep the cache breakpoint off native's per-request context.
-                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'], diag=diag is not None)
+                # The queried frame lets the relay keep the cache breakpoint off native's per-request context;
+                # the workdir lets it pin native's ancestor-dependent git line for that directory (#17).
+                # Canonical form: native reports its getcwd(), which resolves a symlinked TMPDIR.
+                workdir = os.path.realpath(self._workdir())
+                request.admission = Admission(env.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'), timeout, queried=frames[-1]['message']['content'], diag=diag is not None, workdir=workdir)
                 env['ANTHROPIC_BASE_URL'] = request.admission.url
                 # Native settings apply env inside the process, avoiding execve's
                 # per-argument/environment-string limit for full Hermes schemas.
@@ -686,7 +689,7 @@ class Client:
                 effort = parsed.get('output_config', {}).get('effort')
                 if effort:
                     command += ['--effort', effort]
-                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8', cwd=self._workdir(), env=env)
+                p = request.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8', cwd=workdir, env=env)
                 events = queue.Queue()
                 def read():
                     try:

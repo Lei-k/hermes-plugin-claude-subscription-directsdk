@@ -114,6 +114,47 @@ def _normalize_account(messages, queried):
     return True
 
 
+_ENV_HEAD = '# Environment\nYou have been invoked in the following environment: \n - Primary working directory: '
+_GIT_TRUE, _GIT_FALSE = '\n - Is a git repository: true\n', '\n - Is a git repository: false\n'
+
+
+def _stable_workdir_env(messages, workdir):
+    """Pin native's ``Is a git repository`` line for the plugin's own workdir to ``false`` (#17).
+
+    Native writes an environment block into a ``system`` message near the start of every
+    request. Its git line is a fresh filesystem walk from the cwd up to ``/`` for any ``.git``
+    entry, so an unrelated ``.git`` that appears in an ancestor of the plugin's scratch workdir
+    (a test or tool running ``git init`` in a shared temp tree) flips it to ``true`` for just
+    those requests. That one changed block early in history invalidates the cached prefix and
+    the whole conversation is written to cache again, once on the flip and once on the flip
+    back. The workdir is plugin-owned scratch, never a project, and native runs with no tools,
+    so ``false`` is the true and stable answer.
+
+    Only the exact line right after the exact plugin workdir path, inside native's own
+    ``system``-role messages, is changed; host content never arrives in that role. A worktree
+    variant (extra lines between the two) or any other path is forwarded unchanged.
+    Returns whether anything changed."""
+    if not workdir:
+        return False
+    needle = _ENV_HEAD + workdir + _GIT_TRUE
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict) or message.get('role') != 'system':
+            continue
+        content = message.get('content')
+        if isinstance(content, str):
+            if needle in content:
+                message['content'] = content.replace(needle, _ENV_HEAD + workdir + _GIT_FALSE)
+                changed = True
+        elif isinstance(content, list):
+            for block in content:
+                if (isinstance(block, dict) and block.get('type') == 'text'
+                        and isinstance(block.get('text'), str) and needle in block['text']):
+                    block['text'] = block['text'].replace(needle, _ENV_HEAD + workdir + _GIT_FALSE)
+                    changed = True
+    return changed
+
+
 def _frame_first(messages, queried):
     """Put Hermes' first user turn ahead of the context native prepends to it (#77).
 
@@ -146,7 +187,7 @@ def _frame_first(messages, queried):
     return True
 
 
-def pin_message_breakpoint(payload, queried):
+def pin_message_breakpoint(payload, queried, workdir=None):
     """Keep the single message ``cache_control`` on content the next request replays unchanged.
 
     Native attaches per-request context (today's date, the account-email reminder, whatever a
@@ -160,7 +201,8 @@ def pin_message_breakpoint(payload, queried):
     tool_result (parallel calls, native's reminder on the last result), a breakpoint on the
     unchanged results before it measured no cache hit even though they replay byte-identical
     (#33, cause unknown), so the span ends at the preceding assistant message.
-    Recognized native account reminders are first normalized against the host frame.
+    Recognized native account reminders are first normalized against the host frame, and
+    native's git line for the plugin's own ``workdir`` is pinned (#17).
     The breakpoint never moves later within that normalized frame; unparseable payloads
     forward as is."""
     if not queried:
@@ -168,7 +210,8 @@ def pin_message_breakpoint(payload, queried):
     try:
         body = json.loads(payload)
         messages = body['messages']
-        normalized = _normalize_account(messages, queried)
+        normalized = _stable_workdir_env(messages, workdir)
+        normalized = _normalize_account(messages, queried) or normalized
         reordered = _frame_first(messages, queried)
         blocks = [(i, j, b) for i, m in enumerate(messages) if isinstance(m.get('content'), list)
                   for j, b in enumerate(m['content'])]
@@ -262,9 +305,10 @@ class Capture:
 
 
 class Admission:
-    def __init__(self, upstream, timeout, queried=None, diag=False):
+    def __init__(self, upstream, timeout, queried=None, diag=False, workdir=None):
         self.upstream = urlsplit(upstream)
         self.queried = queried
+        self.workdir = workdir
         self.diag = diag
         self.diag_wire = None
         host = self.upstream.hostname
@@ -345,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.settimeout(gate.timeout)
             payload = self.rfile.read(int(self.headers['Content-Length']))
             raw = payload
-            payload = pin_message_breakpoint(payload, gate.queried)
+            payload = pin_message_breakpoint(payload, gate.queried, gate.workdir)
             if gate.diag:
                 # Content-free block hashes only (#17); never alters the forwarded body.
                 try:
